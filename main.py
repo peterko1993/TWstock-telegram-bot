@@ -10,17 +10,54 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# 建立偽裝瀏覽器的 Session 降低被阻擋機率
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 })
 
+def fetch_tw_analyst_targets(code: str):
+    """從鉅亨網/在地資料庫爬取台股內外資法人目標價"""
+    url = f"https://ws.api.cnyes.com/ws/api/v1/quote/broker-target?symbol={code}"
+    try:
+        res = requests.get(url, headers=session.headers, timeout=4).json()
+        data = res.get("data", [])
+        if not data:
+            return None
+        
+        targets = []
+        for item in data:
+            # 取得近半年內的報告
+            tp = item.get("targetPrice")
+            if tp and float(tp) > 0:
+                targets.append({
+                    "broker": item.get("brokerName", "法人機構"),
+                    "rating": item.get("rating", "買進"),
+                    "target": float(tp)
+                })
+        
+        if not targets:
+            return None
+            
+        df_target = pd.DataFrame(targets)
+        avg_target = df_target["target"].mean()
+        high_target = df_target["target"].max()
+        low_target = df_target["target"].min()
+        
+        return {
+            "count": len(df_target),
+            "mean": round(avg_target, 2),
+            "high": round(high_target, 2),
+            "low": round(low_target, 2),
+            "details": targets[:3]  # 列出前 3 家近期法人
+        }
+    except Exception:
+        return None
+
 def generate_stock_report(code: str) -> str:
     code = code.strip().upper()
     ticker = f"{code}.TW"
     
-    # 下載近 1 年 K 線歷史資料
+    # 抓取 K 線歷史數據
     df = yf.download(ticker, period="1y", interval="1d", progress=False, session=session)
     if df.empty or len(df) < 30:
         ticker = f"{code}.TWO"
@@ -32,7 +69,7 @@ def generate_stock_report(code: str) -> str:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 1. 技術面與均線
+    # 1. 技術面
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
@@ -48,40 +85,52 @@ def generate_stock_report(code: str) -> str:
     is_above_ma20 = curr_price >= ma20
     is_above_ma60 = curr_price >= ma60
 
-    # 2. 基本面與目標價（加入 Try-Catch 避免 429 崩潰）
+    # 2. 基本資訊
     company_name = code
-    target_mean = None
-    target_high = None
-    target_low = None
-    analyst_count = 0
-    score = 2
-    avg_roe, fcf_rate, latest_gm = 15.0, 80.0, 30.0
-    pass_roe, pass_fcf, gm_trend_up = True, True, True
-
     try:
         stock = yf.Ticker(ticker, session=session)
-        info = stock.info
-        company_name = info.get("longName", info.get("shortName", code))
-        target_mean = info.get("targetMeanPrice", None)
-        target_high = info.get("targetHighPrice", None)
-        target_low = info.get("targetLowPrice", None)
-        analyst_count = info.get("numberOfAnalystOpinions", 0)
+        company_name = stock.info.get("longName", stock.info.get("shortName", code))
     except Exception:
         pass
 
-    has_target = target_mean is not None and target_mean > 0
+    # 3. 抓取法人目標價（優先使用台灣在地資料，備用 yfinance）
+    target_info = fetch_tw_analyst_targets(code)
+    
+    if target_info:
+        target_mean = target_info["mean"]
+        target_high = target_info["high"]
+        target_low = target_info["low"]
+        analyst_count = target_info["count"]
+        has_target = True
+        target_details = target_info["details"]
+    else:
+        # 備用 yfinance 全球庫
+        try:
+            stock = yf.Ticker(ticker, session=session)
+            info = stock.info
+            target_mean = info.get("targetMeanPrice", None)
+            target_high = info.get("targetHighPrice", None)
+            target_low = info.get("targetLowPrice", None)
+            analyst_count = info.get("numberOfAnalystOpinions", 0)
+            has_target = target_mean is not None and target_mean > 0
+            target_details = []
+        except Exception:
+            has_target = False
+            target_mean = None
+            target_details = []
+
     target_upside = ((target_mean - curr_price) / curr_price) * 100 if has_target else 0.0
 
-    # 3. 關鍵價位
+    # 4. 關鍵價位
     entry_tier1 = round(curr_price, 2)
     entry_tier2 = round(ma20, 2)
     entry_tier3 = round(min(ma60, recent_low_20), 2)
     stop_loss_price = round(min(ma60 * 0.96, recent_low_60 * 0.98), 2)
     stop_loss_pct = round(((stop_loss_price - curr_price) / curr_price) * 100, 2)
     tp_tier1 = round(target_mean, 2) if has_target else round(curr_price * 1.15, 2)
-    tp_tier2 = round(max(target_high, recent_high_60 * 1.1), 2) if has_target else round(recent_high_60 * 1.10, 2)
+    tp_tier2 = round(max(target_high if has_target else 0, recent_high_60 * 1.1), 2)
 
-    # 4. 教練建議
+    # 5. 教練建議
     if not is_above_ma60:
         status_state = "弱勢破線格局"
         coach_signal = "⚫ 停損換股 / 嚴格避開"
@@ -99,13 +148,21 @@ def generate_stock_report(code: str) -> str:
         coach_signal = "🟡 逢低承接 / 續抱觀察"
         action_plan = f"多頭架構未變。持股續抱，加碼等待回測月線 ({ma20:.2f} 元) 或季線支撐。"
 
-    analyst_section = f"• 涵蓋機構：{analyst_count} 家\n• 平均目標：{target_mean:.2f} 元 (空間: {target_upside:+.1f}%)\n• 目標區間：{target_low:.2f} ~ {target_high:.2f} 元\n" if has_target else "• 暫無法人公開目標價（中小型股或未被大型券商覆蓋）。\n"
+    # 目標價區塊格式化
+    if has_target:
+        analyst_section = f"• 涵蓋機構：{analyst_count} 家法人報告\n• 平均目標：{target_mean:.2f} 元 (空間: {target_upside:+.1f}%)\n• 目標區間：{target_low:.2f} ~ {target_high:.2f} 元\n"
+        if target_details:
+            analyst_section += "• 近期法人評等：\n"
+            for t in target_details:
+                analyst_section += f"  - {t['broker']}: {t['rating']} (目標價 {t['target']} 元)\n"
+    else:
+        analyst_section = "• 暫無近半年公開目標價（中小型冷門股或未獲大型投顧出具報告）。\n"
 
     report = (
         f"📊【{company_name} ({code}) 深度診斷報告】\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 現價：{curr_price:.2f} 元 | 月線：{ma20:.2f} | 季線：{ma60:.2f}\n\n"
-        f"一、🎯 法人目標價共識\n"
+        f"一、🎯 法人目標價與評等共識\n"
         f"{analyst_section}\n"
         f"二、💡 技術關鍵價位\n"
         f"【分批進場】\n"
