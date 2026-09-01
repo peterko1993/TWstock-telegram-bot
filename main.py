@@ -5,6 +5,7 @@ import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import twstock
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -15,8 +16,14 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 })
 
+def get_tw_stock_name(code: str) -> str:
+    """自動取得台股標準繁體中文名稱"""
+    if code in twstock.codes:
+        return twstock.codes[code].name
+    return code
+
 def fetch_tw_analyst_targets(code: str):
-    """從鉅亨網/在地資料庫爬取台股內外資法人目標價"""
+    """從在地資料庫爬取台股內外資法人目標價"""
     url = f"https://ws.api.cnyes.com/ws/api/v1/quote/broker-target?symbol={code}"
     try:
         res = requests.get(url, headers=session.headers, timeout=4).json()
@@ -26,7 +33,6 @@ def fetch_tw_analyst_targets(code: str):
         
         targets = []
         for item in data:
-            # 取得近半年內的報告
             tp = item.get("targetPrice")
             if tp and float(tp) > 0:
                 targets.append({
@@ -39,16 +45,12 @@ def fetch_tw_analyst_targets(code: str):
             return None
             
         df_target = pd.DataFrame(targets)
-        avg_target = df_target["target"].mean()
-        high_target = df_target["target"].max()
-        low_target = df_target["target"].min()
-        
         return {
             "count": len(df_target),
-            "mean": round(avg_target, 2),
-            "high": round(high_target, 2),
-            "low": round(low_target, 2),
-            "details": targets[:3]  # 列出前 3 家近期法人
+            "mean": round(df_target["target"].mean(), 2),
+            "high": round(df_target["target"].max(), 2),
+            "low": round(df_target["target"].min(), 2),
+            "details": targets[:3]
         }
     except Exception:
         return None
@@ -56,6 +58,9 @@ def fetch_tw_analyst_targets(code: str):
 def generate_stock_report(code: str) -> str:
     code = code.strip().upper()
     ticker = f"{code}.TW"
+    
+    # 取得繁體中文名稱
+    company_name = get_tw_stock_name(code)
     
     # 抓取 K 線歷史數據
     df = yf.download(ticker, period="1y", interval="1d", progress=False, session=session)
@@ -69,7 +74,7 @@ def generate_stock_report(code: str) -> str:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 1. 技術面
+    # 1. 技術面指標
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
@@ -85,17 +90,8 @@ def generate_stock_report(code: str) -> str:
     is_above_ma20 = curr_price >= ma20
     is_above_ma60 = curr_price >= ma60
 
-    # 2. 基本資訊
-    company_name = code
-    try:
-        stock = yf.Ticker(ticker, session=session)
-        company_name = stock.info.get("longName", stock.info.get("shortName", code))
-    except Exception:
-        pass
-
-    # 3. 抓取法人目標價（優先使用台灣在地資料，備用 yfinance）
+    # 2. 法人目標價
     target_info = fetch_tw_analyst_targets(code)
-    
     if target_info:
         target_mean = target_info["mean"]
         target_high = target_info["high"]
@@ -104,24 +100,13 @@ def generate_stock_report(code: str) -> str:
         has_target = True
         target_details = target_info["details"]
     else:
-        # 備用 yfinance 全球庫
-        try:
-            stock = yf.Ticker(ticker, session=session)
-            info = stock.info
-            target_mean = info.get("targetMeanPrice", None)
-            target_high = info.get("targetHighPrice", None)
-            target_low = info.get("targetLowPrice", None)
-            analyst_count = info.get("numberOfAnalystOpinions", 0)
-            has_target = target_mean is not None and target_mean > 0
-            target_details = []
-        except Exception:
-            has_target = False
-            target_mean = None
-            target_details = []
+        has_target = False
+        target_mean = None
+        target_details = []
 
     target_upside = ((target_mean - curr_price) / curr_price) * 100 if has_target else 0.0
 
-    # 4. 關鍵價位
+    # 3. 關鍵價位
     entry_tier1 = round(curr_price, 2)
     entry_tier2 = round(ma20, 2)
     entry_tier3 = round(min(ma60, recent_low_20), 2)
@@ -130,7 +115,7 @@ def generate_stock_report(code: str) -> str:
     tp_tier1 = round(target_mean, 2) if has_target else round(curr_price * 1.15, 2)
     tp_tier2 = round(max(target_high if has_target else 0, recent_high_60 * 1.1), 2)
 
-    # 5. 教練建議
+    # 4. 教練操作建議
     if not is_above_ma60:
         status_state = "弱勢破線格局"
         coach_signal = "⚫ 停損換股 / 嚴格避開"
@@ -148,7 +133,7 @@ def generate_stock_report(code: str) -> str:
         coach_signal = "🟡 逢低承接 / 續抱觀察"
         action_plan = f"多頭架構未變。持股續抱，加碼等待回測月線 ({ma20:.2f} 元) 或季線支撐。"
 
-    # 目標價區塊格式化
+    # 格式化法人目標價區塊
     if has_target:
         analyst_section = f"• 涵蓋機構：{analyst_count} 家法人報告\n• 平均目標：{target_mean:.2f} 元 (空間: {target_upside:+.1f}%)\n• 目標區間：{target_low:.2f} ~ {target_high:.2f} 元\n"
         if target_details:
@@ -159,7 +144,7 @@ def generate_stock_report(code: str) -> str:
         analyst_section = "• 暫無近半年公開目標價（中小型冷門股或未獲大型投顧出具報告）。\n"
 
     report = (
-        f"📊【{company_name} ({code}) 深度診斷報告】\n"
+        f"📊【 {company_name} ({code}) 深度診斷報告】\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 現價：{curr_price:.2f} 元 | 月線：{ma20:.2f} | 季線：{ma60:.2f}\n\n"
         f"一、🎯 法人目標價與評等共識\n"
@@ -184,19 +169,20 @@ def generate_stock_report(code: str) -> str:
     return report
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 你好！我是你的台股深度診斷助理。\n\n請直接傳送 4 位數台股代號（例如：2330、3653）。")
+    await update.message.reply_text("👋 你好！我是你的台股深度診斷助理。\n\n請直接傳送 4 位數台股代號（例如：2330、6446）。")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     if len(user_text) == 4 and user_text.isdigit():
-        wait_msg = await update.message.reply_text(f"🔍 正在調取【{user_text}】最新行情與法人目標價...")
+        stock_name = get_tw_stock_name(user_text)
+        wait_msg = await update.message.reply_text(f"🔍 正在調取【{stock_name} ({user_text})】最新行情與法人目標價...")
         try:
             report = generate_stock_report(user_text)
             await wait_msg.edit_text(report)
         except Exception as e:
             await wait_msg.edit_text(f"⚠️ 診斷發生錯誤：{str(e)}")
     else:
-        await update.message.reply_text("💡 請直接輸入 4 位數股票代號（例如：2330、3653）。")
+        await update.message.reply_text("💡 請直接輸入 4 位數股票代號（例如：2330、6446）。")
 
 class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
