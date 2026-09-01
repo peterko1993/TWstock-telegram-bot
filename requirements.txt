@@ -1,5 +1,6 @@
-python-telegram-bot
+discord.py
 yfinance
 pandas
 numpy
 twstock
+requests
