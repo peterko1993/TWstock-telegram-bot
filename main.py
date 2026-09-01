@@ -1,5 +1,6 @@
 import os
 import threading
+import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import yfinance as yf
@@ -9,7 +10,6 @@ import twstock
 import discord
 from discord.ext import commands
 
-# 從環境變數讀取 Discord Token
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 
 session = requests.Session()
@@ -162,10 +162,8 @@ def evaluate_seven_fundamentals(stock, info):
 def generate_stock_report(code: str) -> str:
     code = code.strip().upper()
     ticker = f"{code}.TW"
-    
     company_name = get_tw_stock_name(code)
     
-    # 抓取 K 線
     df = yf.download(ticker, period="1y", interval="1d", progress=False, session=session)
     if df.empty or len(df) < 30:
         ticker = f"{code}.TWO"
@@ -177,7 +175,6 @@ def generate_stock_report(code: str) -> str:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 技術面
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
@@ -193,13 +190,11 @@ def generate_stock_report(code: str) -> str:
     is_above_ma20 = curr_price >= ma20
     is_above_ma60 = curr_price >= ma60
 
-    # 七大體質
     stock = yf.Ticker(ticker, session=session)
     info = stock.info if hasattr(stock, "info") else {}
     fund = evaluate_seven_fundamentals(stock, info)
     score = fund["pass_count"]
 
-    # 法人目標價
     target_info = fetch_tw_analyst_targets(code)
     if target_info:
         target_mean = target_info["mean"]
@@ -215,7 +210,6 @@ def generate_stock_report(code: str) -> str:
 
     target_upside = ((target_mean - curr_price) / curr_price) * 100 if has_target else 0.0
 
-    # 關鍵價位
     entry_tier1 = round(curr_price, 2)
     entry_tier2 = round(ma20, 2)
     entry_tier3 = round(min(ma60, recent_low_20), 2)
@@ -224,7 +218,6 @@ def generate_stock_report(code: str) -> str:
     tp_tier1 = round(target_mean, 2) if has_target else round(curr_price * 1.15, 2)
     tp_tier2 = round(max(target_high if has_target else 0, recent_high_60 * 1.1), 2)
 
-    # 教練決策
     if not is_above_ma60 and score < 4:
         status_state = "弱勢破線格局（跌破季線 且 體質未達標）"
         coach_signal = "⚫ 停損換股 / 嚴格避開"
@@ -257,8 +250,7 @@ def generate_stock_report(code: str) -> str:
     else:
         analyst_section = "• 暫無近半年公開目標價（中小型股或未被大型投顧覆蓋）。\n"
 
-    # Discord 格式輸出
-    report = (
+    return (
         f"📊 **【 {company_name} ({code}) 長線全方位深度診斷】**\n"
         f"────────────────────────\n"
         f"📌 現價：`{curr_price:.2f} 元` | 月線：`{ma20:.2f}` | 季線：`{ma60:.2f}`\n\n"
@@ -289,39 +281,47 @@ def generate_stock_report(code: str) -> str:
         f"• 決策理由：{action_plan}\n"
         f"────────────────────────"
     )
-    return report
 
 # ================= Discord 機器人本體 =================
 intents = discord.Intents.default()
-intents.message_content = True  # 開啟讀取文字訊息權限
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    print("=" * 50)
     print(f"🤖 Discord 機器人已成功在線！登入身分：{bot.user}")
+    print("=" * 50)
 
 @bot.event
 async def on_message(message):
-    # 忽略機器人自己發送的訊息
     if message.author == bot.user:
         return
 
     user_text = message.content.strip()
-    
-    # 判斷是否為 4 位數台股代碼
+    print(f"📥 [收到訊息] 來自【{message.author}】在頻道【{message.channel}】：'{user_text}'")
+
+    # 1. 測試指令
+    if user_text.lower() == "ping":
+        await message.channel.send("🏓 Pong! 機器人連線完全正常！請輸入 4 位數股票代碼（如 2330）。")
+        return
+
+    # 2. 判斷 4 位數股票代碼
     if len(user_text) == 4 and user_text.isdigit():
         stock_name = get_tw_stock_name(user_text)
-        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行七大體質健檢與價位精算，請稍候...")
+        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行七大體質健檢與價位精算，請稍候約 3~5 秒...")
         try:
-            report = generate_stock_report(user_text)
+            # 使用非同步背景執行緒，避免卡住 Discord
+            report = await asyncio.to_thread(generate_stock_report, user_text)
             await wait_msg.edit(content=report)
         except Exception as e:
+            print(f"❌ 產生報告錯誤: {e}")
             await wait_msg.edit(content=f"⚠️ 診斷發生錯誤：{str(e)}")
             
     await bot.process_commands(message)
 
-# ================= 輕量 Web 伺服器 (供 Render 綁定 Port) =================
+# ================= 輕量 Web 伺服器 =================
 class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -335,7 +335,8 @@ def run_web():
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    
-    # 讀取環境變數或直接使用
-    token = DISCORD_BOT_TOKEN or "MTU0NDI0OTA0NzUzNDAxODY0MA.GBU2Sp.GLkRbQVI3Aw_6Uy7aw-3HPjCowrPBqyulZdrhA"
-    bot.run(token)
+    token = DISCORD_BOT_TOKEN
+    if not token:
+        print("❌ 錯誤：未在環境變數中找到 DISCORD_BOT_TOKEN！")
+    else:
+        bot.run(token)
