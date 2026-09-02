@@ -1,6 +1,5 @@
-discord.py
-yfinance
-pandas
-numpy
-twstock
-requests
+discord.py>=2.3.2
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+twstock>=0.2.2
