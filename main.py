@@ -56,8 +56,8 @@ def fetch_tw_analyst_targets(code: str):
     except Exception:
         return None
 
-def evaluate_seven_fundamentals(stock, info):
-    """計算並檢驗七大長線核心基本面指標（含毛利率變異係數 CV 排除循環股）"""
+def evaluate_eight_fundamentals(stock, info):
+    """計算並檢驗八大長線核心基本面指標（含 CV 防景氣循環濾網）"""
     fin = stock.financials
     bs = stock.balance_sheet
     cf = stock.cashflow
@@ -71,6 +71,7 @@ def evaluate_seven_fundamentals(stock, info):
         "gm_str": "資料不足", "pass_gm": False,
         "peg_str": "資料不足", "pass_peg": False,
         "payout_str": "資料不足", "pass_payout": False,
+        "cv_str": "資料不足", "pass_cv": False,
         "pe": None
     }
     
@@ -85,7 +86,7 @@ def evaluate_seven_fundamentals(stock, info):
         roe_series = (net_incomes[common_years] / equity[common_years]) * 100
         avg_roe = roe_series.mean()
         min_roe = roe_series.min()
-        pass_roe = (avg_roe >= 15.0) and (min_roe >= 8.0)
+        pass_roe = bool((avg_roe >= 15.0) and (min_roe >= 8.0))
         results["roe_str"] = f"均值 {avg_roe:.1f}% (低點 {min_roe:.1f}%)"
         results["pass_roe"] = pass_roe
 
@@ -98,7 +99,7 @@ def evaluate_seven_fundamentals(stock, info):
         common_roic_years = nopat.index.intersection(invested_cap.index)
         roic_series = (nopat[common_roic_years] / invested_cap[common_roic_years]) * 100
         avg_roic = roic_series.dropna().mean() if not roic_series.dropna().empty else avg_roe * 0.85
-        pass_roic = avg_roic >= 12.0
+        pass_roic = bool(avg_roic >= 12.0)
         results["roic_str"] = f"均值 {avg_roic:.1f}%"
         results["pass_roic"] = pass_roic
 
@@ -106,7 +107,7 @@ def evaluate_seven_fundamentals(stock, info):
         total_liab = bs.loc["Total Liabilities Net Minority Interest"].iloc[0] if "Total Liabilities Net Minority Interest" in bs.index else 0
         total_assets = bs.loc["Total Assets"].iloc[0] if "Total Assets" in bs.index else 1
         debt_ratio = (total_liab / total_assets) * 100 if total_assets > 0 else 0
-        pass_debt = debt_ratio < 50.0
+        pass_debt = bool(debt_ratio < 50.0)
         results["debt_str"] = f"{debt_ratio:.1f}%"
         results["pass_debt"] = pass_debt
 
@@ -118,23 +119,18 @@ def evaluate_seven_fundamentals(stock, info):
         total_fcf = fcf_series[common_cf_years].sum()
         total_ni = net_incomes[common_cf_years].sum()
         fcf_rate = (total_fcf / total_ni) * 100 if total_ni > 0 else 0
-        pass_fcf = fcf_rate >= 80.0
+        pass_fcf = bool(fcf_rate >= 80.0)
         results["fcf_str"] = f"{fcf_rate:.0f}%"
         results["pass_fcf"] = pass_fcf
 
-        # 5. 毛利率走勢 + 變異係數 CV < 25% (排除景氣循環股)
+        # 5. 毛利率走勢 (持穩/上升)
         gross_profit = fin.loc["Gross Profit"]
         total_rev = fin.loc["Total Revenue"]
         gm_series = (gross_profit / total_rev) * 100
-        latest_gm = float(gm_series.iloc[0])
-        avg_gm = float(gm_series.mean())
-        std_gm = float(gm_series.std(ddof=0)) if len(gm_series) > 1 else 0.0
-        cv_gm = (std_gm / avg_gm * 100.0) if avg_gm > 0 else 999.0
-        
-        # 條件：最新不嚴重衰退 且 CV < 25%（非暴起暴落）
-        pass_gm = (latest_gm >= avg_gm - 1.5) and (cv_gm < 25.0)
-        cv_status = "穩定" if cv_gm < 25.0 else "循環劇烈"
-        results["gm_str"] = f"最新 {latest_gm:.1f}% (均 {avg_gm:.1f}%, CV: {cv_gm:.1f}%【{cv_status}】)"
+        latest_gm = gm_series.iloc[0]
+        avg_gm = gm_series.mean()
+        pass_gm = bool(latest_gm >= avg_gm - 1.5)
+        results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
         results["pass_gm"] = pass_gm
 
         # 6. PEG <= 1.2 或 PE <= 20
@@ -144,7 +140,7 @@ def evaluate_seven_fundamentals(stock, info):
         n_years = len(total_rev) - 1
         rev_cagr = (((rev_end / rev_start) ** (1 / n_years)) - 1) * 100 if (rev_start > 0 and n_years > 0) else 0
         peg = (pe / rev_cagr) if (pe and rev_cagr > 0) else np.nan
-        pass_peg = (peg <= 1.2) if not np.isnan(peg) else (pe and pe <= 20.0)
+        pass_peg = bool((peg <= 1.2) if not np.isnan(peg) else (pe and pe <= 20.0))
         results["peg_str"] = f"PEG {peg:.2f}" if not np.isnan(peg) else (f"PE {pe:.1f}x" if pe else "N/A")
         results["pass_peg"] = pass_peg
 
@@ -152,14 +148,28 @@ def evaluate_seven_fundamentals(stock, info):
         payout_val = info.get("payoutRatio", None)
         payout_pct = payout_val * 100 if payout_val else None
         if payout_pct is not None:
-            pass_payout = 35.0 <= payout_pct <= 65.0
+            pass_payout = bool(35.0 <= payout_pct <= 65.0)
             results["payout_str"] = f"{payout_pct:.1f}%"
         else:
             pass_payout = True
             results["payout_str"] = "約 45%~55%"
         results["pass_payout"] = pass_payout
 
-        results["pass_count"] = sum([pass_roe, pass_roic, pass_debt, pass_fcf, pass_gm, pass_peg, pass_payout])
+        # 8. 毛利率變異係數 (CV < 25%，排除景氣循環劇烈波動)
+        gm_std = gm_series.std()
+        if avg_gm > 0:
+            cv_val = (gm_std / avg_gm) * 100
+            pass_cv = bool(cv_val < 25.0)
+            results["cv_str"] = f"CV {cv_val:.1f}% (標準差 {gm_std:.1f}%)"
+            results["pass_cv"] = pass_cv
+        else:
+            results["cv_str"] = "毛利異常"
+            results["pass_cv"] = False
+
+        results["pass_count"] = sum([
+            pass_roe, pass_roic, pass_debt, pass_fcf,
+            pass_gm, pass_peg, pass_payout, results["pass_cv"]
+        ])
 
     except Exception:
         pass
@@ -178,7 +188,7 @@ def calculate_valuation_bands(curr_price, pe, target_mean):
     else:
         cheap_pe, fair_pe, expensive_pe = None, None, None
 
-    # 模型 B：法人目標價折價（安全邊際模型）
+    # 模型 B：法人目標價折價（安全邊際）
     if target_mean and target_mean > 0:
         cheap_target = target_mean * 0.78
         fair_target = target_mean * 0.88
@@ -204,9 +214,8 @@ def calculate_valuation_bands(curr_price, pe, target_mean):
         fair_val = round(curr_price * 0.95, 2)
         expensive_val = round(curr_price * 1.20, 2)
 
-    # 判定當前位階
     if curr_price <= cheap_val:
-        zone_status = "🟢 便宜價區間（安全邊際充足，適合分批佈局）"
+        zone_status = "🟢 便宜價區間（安全邊際充足，適合積極分批）"
         zone_type = "CHEAP"
     elif cheap_val < curr_price <= fair_val:
         zone_status = "🟡 合理偏低區間（估值健康，可穩健建倉）"
@@ -215,7 +224,7 @@ def calculate_valuation_bands(curr_price, pe, target_mean):
         zone_status = "⚪ 合理偏高區間（成長預期充分反映，續抱不追高）"
         zone_type = "FAIR_HIGH"
     else:
-        zone_status = "🔴 昂貴價區間（估值過熱，防範回檔修正）"
+        zone_status = "🔴 昂貴價區間（估值過熱，防範技術修正風險）"
         zone_type = "EXPENSIVE"
 
     return {
@@ -231,46 +240,49 @@ def generate_stock_report(code: str) -> str:
     ticker = f"{code}.TW"
     company_name = get_tw_stock_name(code)
     
-    # 抓取 K 線數據
     df = yf.download(ticker, period="1y", interval="1d", progress=False, session=session)
-    if df.empty or len(df) < 30:
+    if df.empty or len(df) < 65:
         ticker = f"{code}.TWO"
         df = yf.download(ticker, period="1y", interval="1d", progress=False, session=session)
         
-    if df.empty or len(df) < 30:
-        return f"⚠️ 查無代號【{code}】的交易資料，請確認是否為 4 位數台股代碼。"
+    if df.empty or len(df) < 65:
+        return f"⚠️ 查無代號【{code}】的完整歷史交易資料，請確認是否為 4 位數台股代碼。"
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 技術面計算（月線、季線）
+    # 技術面與雙日確認指標計算
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
     close_today = float(df['Close'].iloc[-1])
-    close_prev = float(df['Close'].iloc[-2]) if len(df) >= 2 else close_today
-    ma20 = float(df['MA20'].iloc[-1]) if not np.isnan(df['MA20'].iloc[-1]) else close_today
-    ma60_today = float(df['MA60'].iloc[-1]) if not np.isnan(df['MA60'].iloc[-1]) else close_today
-    ma60_prev = float(df['MA60'].iloc[-2]) if len(df) >= 2 and not np.isnan(df['MA60'].iloc[-2]) else ma60_today
+    close_yesterday = float(df['Close'].iloc[-2])
+    ma20_today = float(df['MA20'].iloc[-1])
+    ma60_today = float(df['MA60'].iloc[-1])
+    ma60_yesterday = float(df['MA60'].iloc[-2])
     
     recent_high_60 = float(df['High'].iloc[-60:].max())
     recent_low_60 = float(df['Low'].iloc[-60:].min())
     recent_low_20 = float(df['Low'].iloc[-20:].min())
 
-    curr_price = close_today
-    is_above_ma20 = curr_price >= ma20
-    is_above_ma60 = curr_price >= ma60_today
+    # 雙日收盤價跌破季線確認邏輯
+    today_below_ma60 = close_today < ma60_today
+    yesterday_below_ma60 = close_yesterday < ma60_yesterday
+    consecutive_2day_breakdown = today_below_ma60 and yesterday_below_ma60
+    single_day_breakdown = today_below_ma60 and not yesterday_below_ma60
+    above_ma60 = close_today >= ma60_today
 
-    # 實作 2-Day Filter（連續兩日收盤跌破季線確認）
-    below_ma60_today = close_today < ma60_today
-    below_ma60_prev = close_prev < ma60_prev
-    is_breakdown_confirmed = below_ma60_today and below_ma60_prev   # 連續兩日跌破
-    is_breakdown_testing = below_ma60_today and not below_ma60_prev # 今日首日跌破
+    if consecutive_2day_breakdown:
+        breakdown_status = "🔴 連續 2 日收盤跌破季線（實體跌破確認，觸發停損/減碼防守）"
+    elif single_day_breakdown:
+        breakdown_status = "🟡 首日收盤跌破季線（列入警戒觀察，切勿恐慌殺低，待次日收盤確認）"
+    else:
+        breakdown_status = "🟢 穩居 60MA 季線之上（長線多頭架構完好）"
 
-    # 七大體質
+    # 八大體質檢驗
     stock = yf.Ticker(ticker, session=session)
     info = stock.info if hasattr(stock, "info") else {}
-    fund = evaluate_seven_fundamentals(stock, info)
+    fund = evaluate_eight_fundamentals(stock, info)
     score = fund["pass_count"]
 
     # 法人目標價
@@ -287,57 +299,49 @@ def generate_stock_report(code: str) -> str:
         target_mean = None
         target_details = []
 
-    target_upside = ((target_mean - curr_price) / curr_price) * 100 if has_target else 0.0
+    target_upside = ((target_mean - close_today) / close_today) * 100 if has_target else 0.0
 
     # 價格區間計算
-    val_bands = calculate_valuation_bands(curr_price, fund["pe"], target_mean)
+    val_bands = calculate_valuation_bands(close_today, fund["pe"], target_mean)
 
     # 技術關鍵價位
-    entry_tier1 = round(curr_price, 2)
-    entry_tier2 = round(ma20, 2)
+    entry_tier1 = round(close_today, 2)
+    entry_tier2 = round(ma20_today, 2)
     entry_tier3 = round(min(ma60_today, recent_low_20), 2)
-    stop_loss_price = round(min(ma60_today * 0.96, recent_low_60 * 0.98), 2)
-    stop_loss_pct = round(((stop_loss_price - curr_price) / curr_price) * 100, 2)
+    stop_loss_price = round(min(ma60_today * 0.97, recent_low_60 * 0.98), 2)
+    stop_loss_pct = round(((stop_loss_price - close_today) / close_today) * 100, 2)
     tp_tier1 = round(target_mean, 2) if has_target else round(val_bands["fair"] * 1.15, 2)
     tp_tier2 = round(max(target_high if has_target else 0, val_bands["expensive"]), 2)
 
-    # 操盤教練決策邏輯（整合 2-Day 季線確認與 CV 風控）
-    if is_breakdown_confirmed and score < 4:
-        status_state = "弱勢破線確立（連續 2 日收盤跌破季線 且 體質未達標）"
-        coach_signal = "⚫ 停損換股 / 嚴格避開"
-        action_plan = f"已連續 2 日收盤價低於 60MA 季線 ({ma60_today:.2f} 元)，且體質僅得 {score}/7 分。依紀律啟動停損換股，保留現金防範主跌段。"
-    elif is_breakdown_testing:
-        status_state = "季線回測警戒（首日跌破季線，防假跌破洗盤）"
-        coach_signal = "🟡 警戒觀察 / 待明日收盤確認"
-        action_plan = f"今日收盤首度跌破 60MA 季線 ({ma60_today:.2f} 元)。啟動 2-Day 雙日確認濾網，暫不盲目市價砍單，若明日收盤仍無法站回再行減碼。"
+    # 教練決策引擎（整合 8 項體質 + 雙日確認 + 估值區間）
+    if consecutive_2day_breakdown:
+        status_state = "破線轉弱格局（連續兩日收盤跌破季線）"
+        coach_signal = "⚫ 停損離場 / 減碼避開"
+        action_plan = "已觸發【雙日收盤跌破季線】之硬性風控條件，消除假跌破疑慮。長線資金應嚴格保護本金，執行停損或將資金轉往防禦配置。"
+    elif single_day_breakdown:
+        status_state = "回測測試季線（首日跌破，假跌破洗盤觀察中）"
+        coach_signal = "🟠 警戒觀察 / 暫不動作"
+        action_plan = "今日為首度收盤跌破季線，主力常利用單日摜破誘空。請勿在盤中恐慌砍倉，密切觀察次日收盤能否帶量拉回季線之上。"
+    elif not fund["pass_cv"]:
+        status_state = "毛利波動劇烈（高度疑似景氣循環陷阱）"
+        coach_signal = "🟠 提高警覺 / 不宜重倉"
+        action_plan = f"該標的毛利率變異係數 ({fund['cv_str']}) 超過 25% 安全門檻，獲利隨景氣週期劇烈起伏，即便當前本益比偏低亦不宜作為長線核心重倉。"
     elif val_bands["zone_type"] == "EXPENSIVE" or (has_target and target_upside < -5.0):
         status_state = "估值過熱區間（高於昂貴價 / 超越目標價）"
         coach_signal = "🔴 分批獲利了結"
-        action_plan = f"現價處於昂貴價 ({val_bands['expensive']} 元) 之上，風險報酬比降低，建議在第一/第二目標位逐步減碼收回利潤。"
-    elif score >= 5 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and is_above_ma60:
-        status_state = "黃金共振進場（頂級護城河 ＋ 估值偏低 ＋ 站穩季線）"
-        coach_signal = "🟢 強力買進 / 積極建倉"
-        action_plan = f"體質通過 {score}/7 項且處於【{val_bands['zone_status'].split('（')[0]}】，安全邊際充足，建議按 30%(現價) / 40%(回測月線右側止跌) / 30%(突破) 梯隊布局。"
-    elif score >= 4 and is_above_ma60:
-        status_state = "多頭穩健推進（基本面良好 ＋ 估值合理）"
+        action_plan = f"現價處於昂貴價 ({val_bands['expensive']} 元) 之上，風險收益比轉差，建議在第一/第二目標位逐步減碼 1/3 ~ 1/2 鎖定利潤。"
+    elif score >= 6 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and above_ma60:
+        status_state = "黃金共振進場（頂級護城河 ＋ 估值具安全邊際 ＋ 季線支撐）"
+        coach_signal = "🟢 強力買進 / 積極分批"
+        action_plan = f"八大體質拿下 {score}/8 高分（通過週期過濾），落入【{val_bands['zone_status'].split('（')[0]}】。建議落實 30%(現價) / 40%(回測月線止跌) / 30%(突破季線) 分批建倉。"
+    elif score >= 5 and above_ma60:
+        status_state = "多頭穩健推進（基本面良好 ＋ 趨勢健康）"
         coach_signal = "🟡 逢低承接 / 續抱觀察"
-        action_plan = f"多頭架構未變。持股續抱，加碼等待股價拉回月線 ({ma20:.2f} 元) 出現右側止跌紅 K 再行介入。"
-    elif score >= 5 and not is_above_ma60:
-        status_state = "好公司遇逆風（體質優異但處於均線修正）"
-        coach_signal = "🟠 觀察等待 / 待站回季線再進"
-        action_plan = f"毛利穩定且長線體質拿下 {score}/7 分，但目前受大盤壓制於季線下方。列入核心觀察池，靜待放量站回季線確立底部。"
+        action_plan = f"體質評分良好 ({score}/8) 且季線支撐明確。原有部位續抱；欲加碼者等待股價拉回月線 ({ma20_today:.2f} 元) 出現右側止跌紅 K 再行介入。"
     else:
-        status_state = "盤整待變 / 競爭優勢普通"
+        status_state = "盤整待變 / 競爭優勢不明顯"
         coach_signal = "🟠 觀望等待"
-        action_plan = "多空訊號未達共振標準，長線護城河尚不明確，建議保留現金耐心等待。"
-
-    # 季線位階提示
-    if is_breakdown_confirmed:
-        ma60_status_text = f"`{ma60_today:.2f}` (⚠️ 連續2日跌破確立)"
-    elif is_breakdown_testing:
-        ma60_status_text = f"`{ma60_today:.2f}` (⚠️ 今日首度跌破，待明日確認)"
-    else:
-        ma60_status_text = f"`{ma60_today:.2f}` (🟢 守穩)"
+        action_plan = "多空條件未達共振標準，未見顯著安全邊際，建議保留現金耐心等待右側買點。"
 
     if has_target:
         analyst_section = f"• 涵蓋機構：{analyst_count} 家法人報告\n• 平均目標：**{target_mean:.2f} 元** (空間: `{target_upside:+.1f}%`)\n• 目標區間：{target_low:.2f} ~ {target_high:.2f} 元\n"
@@ -350,15 +354,16 @@ def generate_stock_report(code: str) -> str:
     return (
         f"📊 **【 {company_name} ({code}) 長線全方位深度診斷】**\n"
         f"────────────────────────\n"
-        f"📌 現價：`{curr_price:.2f} 元` | 月線：`{ma20:.2f}` | 季線：{ma60_status_text}\n\n"
-        f"🏛️ **一、長線七大核心體質檢驗 ({score}/7 通過)**\n"
+        f"📌 現價：`{close_today:.2f} 元` | 月線：`{ma20_today:.2f}` | 季線：`{ma60_today:.2f}`\n\n"
+        f"🏛️ **一、長線八大核心體質檢驗 ({score}/8 通過)**\n"
         f"1. ROE (均≧15%,低≧8%): {fund['roe_str']} ({'✅' if fund['pass_roe'] else '❌'})\n"
         f"2. ROIC (均≧12%): {fund['roic_str']} ({'✅' if fund['pass_roic'] else '❌'})\n"
         f"3. 負債比率 (<50%): {fund['debt_str']} ({'✅' if fund['pass_debt'] else '❌'})\n"
         f"4. 自由現金流率 (≧80%): {fund['fcf_str']} ({'✅' if fund['pass_fcf'] else '⚠️'})\n"
-        f"5. 毛利穩定度 (CV<25%且持穩): {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'})\n"
+        f"5. 毛利率走勢 (持穩/上升): {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'})\n"
         f"6. 估值比 (PEG≦1.2/合理): {fund['peg_str']} ({'✅' if fund['pass_peg'] else '⚠️'})\n"
-        f"7. 盈餘配發率 (35%-65%): {fund['payout_str']} ({'✅' if fund['pass_payout'] else '⚠️'})\n\n"
+        f"7. 盈餘配發率 (35%-65%): {fund['payout_str']} ({'✅' if fund['pass_payout'] else '⚠️'})\n"
+        f"8. 毛利變異係數 (CV<25% 防週期): {fund['cv_str']} ({'✅' if fund['pass_cv'] else '❌ 週期波動大'})\n\n"
         f"🏷️ **二、長線合理價格區間評估**\n"
         f"• 便宜價（安全邊際）：`{val_bands['cheap']} 元`\n"
         f"• 合理價（公允價值）：`{val_bands['fair']} 元`\n"
@@ -366,14 +371,15 @@ def generate_stock_report(code: str) -> str:
         f"• **當前位階**：{val_bands['zone_status']}\n\n"
         f"🎯 **三、法人目標價與評等共識**\n"
         f"{analyst_section}\n"
-        f"💡 **四、技術關鍵價位（含 2-Day 防守）**\n"
+        f"💡 **四、技術關鍵價位與風控防守**\n"
         f"【分批進場梯隊】\n"
         f"• 第一批(現價底倉 30%)：`{entry_tier1} 元`\n"
-        f"• 第二批(月線加碼 40%)：`{entry_tier2} 元` (需待右側止跌紅 K)\n"
+        f"• 第二批(月線加碼 40%)：`{entry_tier2} 元`\n"
         f"• 第三批(季線防守 30%)：`{entry_tier3} 元`\n"
-        f"【停損防守機制】\n"
-        f"• 關鍵防守線：`{stop_loss_price} 元` (`{stop_loss_pct}%`)\n"
-        f"• 執行守則：收盤價連續 2 日跌破季線 ({ma60_today:.2f} 元) 方執行停損\n"
+        f"【雙日跌破確認風控機制】\n"
+        f"• 季線生命線：`{ma60_today:.2f} 元`\n"
+        f"• 均線防守狀態：{breakdown_status}\n"
+        f"• 關鍵實體停損價：`{stop_loss_price} 元` (`{stop_loss_pct}%`)\n"
         f"【目標停利點】\n"
         f"• 第一目標(減碼 1/2)：`{tp_tier1} 元`\n"
         f"• 第二目標(波段全出)：`{tp_tier2} 元`\n\n"
@@ -403,7 +409,6 @@ async def on_message(message):
         return
 
     user_text = message.content.strip()
-    print(f"📥 [收到訊息] 來自【{message.author}】：'{user_text}'")
 
     if user_text.lower() == "ping":
         await message.channel.send("🏓 Pong! 機器人連線完全正常！請輸入 4 位數股票代碼（如 2330）。")
@@ -411,7 +416,7 @@ async def on_message(message):
 
     if len(user_text) == 4 and user_text.isdigit():
         stock_name = get_tw_stock_name(user_text)
-        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行七大體質檢驗(含CV景氣過濾)與 2-Day 季線分析，請稍候約 3~5 秒...")
+        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行八大體質檢驗與雙日跌破風控精算，請稍候約 3~5 秒...")
         try:
             report = await asyncio.to_thread(generate_stock_report, user_text)
             await wait_msg.edit(content=report)
@@ -421,7 +426,7 @@ async def on_message(message):
             
     await bot.process_commands(message)
 
-# ================= 輕量 Web 伺服器 (Render 保活用) =================
+# ================= 輕量 Web 伺服器 (Render 保持在線) =================
 class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
