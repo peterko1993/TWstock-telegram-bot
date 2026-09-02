@@ -4,6 +4,7 @@ import threading
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import twstock
@@ -58,12 +59,28 @@ def fetch_cnyes_kline(code: str, days: int = 730):
                     return df, symbol
         except Exception:
             continue
+            
+    # 備援防護：若鉅亨網未回應，自動無縫切換至備援下載
+    try:
+        ticker = f"{code}.TWO" if is_otc else f"{code}.TW"
+        df_backup = yf.download(ticker, period="2y", interval="1d", progress=False)
+        if df_backup.empty and not is_otc:
+            df_backup = yf.download(f"{code}.TWO", period="2y", interval="1d", progress=False)
+            
+        if not df_backup.empty and len(df_backup) >= 30:
+            if isinstance(df_backup.columns, pd.MultiIndex):
+                df_backup.columns = df_backup.columns.get_level_values(0)
+            df_backup['Volume_Shares'] = df_backup['Volume']
+            df_backup['Volume_Lots'] = df_backup['Volume'] / 1000
+            return df_backup, f"BACKUP:{code}"
+    except Exception:
+        pass
 
     return None, None
 
 def fetch_cnyes_quote(symbol: str, code: str):
-    """取得即時報價"""
-    target_symbol = symbol or f"TWS:{code}:STOCK"
+    """以正確的上市/上櫃代碼取得即時報價"""
+    target_symbol = symbol if (symbol and not symbol.startswith("BACKUP")) else f"TWS:{code}:STOCK"
     url = f"https://ws.api.cnyes.com/ws/api/v1/quote/quotes/{target_symbol}"
     try:
         res = requests.get(url, headers=CNYES_HEADERS, timeout=4)
@@ -76,8 +93,8 @@ def fetch_cnyes_quote(symbol: str, code: str):
         return {}
 
 def fetch_cnyes_financial_ratios(symbol: str, code: str):
-    """取得財務比率"""
-    target_symbol = symbol or f"TWS:{code}:STOCK"
+    """以正確的上市/上櫃代碼取得財務比率"""
+    target_symbol = symbol if (symbol and not symbol.startswith("BACKUP")) else f"TWS:{code}:STOCK"
     url = f"https://ws.api.cnyes.com/ws/api/v1/quote/stock/financial/ratio?symbol={target_symbol}&period=year"
     try:
         res = requests.get(url, headers=CNYES_HEADERS, timeout=4)
@@ -241,7 +258,7 @@ def evaluate_nine_fundamentals(quote_info: dict, fin_ratios: list, df: pd.DataFr
         except Exception:
             pass
 
-    # 9. 市場流動性檢驗
+    # 9. 市場流動性檢驗 (近 20 日日均 >= 3000萬 或 >= 500張)
     try:
         if len(df) >= 20:
             recent_20 = df.iloc[-20:]
@@ -322,7 +339,7 @@ def calculate_valuation_bands(curr_price, pe, target_mean):
 def generate_stock_report(code: str) -> str:
     code = code.strip().upper()
     
-    # 1. 抓取 K 線
+    # 1. 抓取 K 線（上市上櫃自動相容）
     df, valid_symbol = fetch_cnyes_kline(code)
     if df is None or len(df) < 30:
         return f"⚠️ 查無代號【{code}】的歷史交易資料，請確認代碼是否正確。"
@@ -353,6 +370,7 @@ def generate_stock_report(code: str) -> str:
     recent_low_60 = float(df['Low'].iloc[-60:].min()) if len(df) >= 60 else float(df['Low'].min())
     recent_low_20 = float(df['Low'].iloc[-20:].min())
 
+    # 雙日收盤價跌破季線確認機制
     today_below_ma60 = close_today < ma60_today
     yesterday_below_ma60 = close_yesterday < ma60_yesterday
     consecutive_2day_breakdown = today_below_ma60 and yesterday_below_ma60
@@ -491,7 +509,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print("=" * 50)
-    print(f"🤖 鉅亨網版 Discord 機器人已成功在線！登入身分：{bot.user}")
+    print(f"🤖 全功能雙軌 Discord 機器人已在線！登入身分：{bot.user}")
     print("=" * 50)
 
 @bot.event
@@ -502,12 +520,12 @@ async def on_message(message):
     user_text = message.content.strip()
 
     if user_text.lower() == "ping":
-        await message.channel.send("🏓 Pong! 鉅亨網資料連線正常！請輸入 4 位數台股代碼（如 2330、6138）。")
+        await message.channel.send("🏓 Pong! 雙軌診斷機器人連線完全正常！請輸入 4 位數台股代碼（如 2330、6138）。")
         return
 
     if len(user_text) == 4 and user_text.isdigit():
         stock_name = get_tw_stock_name(user_text)
-        wait_msg = await message.channel.send(f"🔍 正在連線鉅亨網對【{stock_name} ({user_text})】進行診斷，請稍候約 1 秒...")
+        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行長短雙軌全方位診斷，請稍候約 1~2 秒...")
         try:
             report = await asyncio.to_thread(generate_stock_report, user_text)
             await wait_msg.edit(content=report)
@@ -517,13 +535,13 @@ async def on_message(message):
             
     await bot.process_commands(message)
 
-# ================= 輕量 Web 伺服器 =================
+# ================= 輕量 Web 伺服器 (Render 保持在線) =================
 
 class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"cnYES Discord Bot is running smoothly 24/7!")
+        self.wfile.write(b"Bot is online and running 24/7!")
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
