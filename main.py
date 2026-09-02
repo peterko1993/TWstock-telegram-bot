@@ -56,8 +56,8 @@ def fetch_tw_analyst_targets(code: str):
     except Exception:
         return None
 
-def evaluate_eight_fundamentals(stock, info):
-    """計算並檢驗八大長線核心基本面指標（含 CV 防景氣循環濾網）"""
+def evaluate_nine_fundamentals(stock, info, df):
+    """計算並檢驗九大長線核心基本面與流動性指標"""
     fin = stock.financials
     bs = stock.balance_sheet
     cf = stock.cashflow
@@ -72,115 +72,126 @@ def evaluate_eight_fundamentals(stock, info):
         "peg_str": "資料不足", "pass_peg": False,
         "payout_str": "資料不足", "pass_payout": False,
         "cv_str": "資料不足", "pass_cv": False,
+        "liq_str": "資料不足", "pass_liq": False,
         "pe": None
     }
     
-    if fin.empty or bs.empty or cf.empty or fin.shape[1] < 3:
-        return results
+    # 1~8 項財務體質檢驗
+    if not (fin.empty or bs.empty or cf.empty or fin.shape[1] < 3):
+        try:
+            # 1. ROE (歷年平均 >= 15%, 低點 >= 8%)
+            net_incomes = fin.loc["Net Income Common Stockholders"] if "Net Income Common Stockholders" in fin.index else fin.loc["Net Income"]
+            equity = bs.loc["Stockholders Equity"] if "Stockholders Equity" in bs.index else bs.loc["Total Equity Gross Minority Interest"]
+            common_years = net_incomes.index.intersection(equity.index)
+            roe_series = (net_incomes[common_years] / equity[common_years]) * 100
+            avg_roe = roe_series.mean()
+            min_roe = roe_series.min()
+            pass_roe = bool((avg_roe >= 15.0) and (min_roe >= 8.0))
+            results["roe_str"] = f"均值 {avg_roe:.1f}% (低點 {min_roe:.1f}%)"
+            results["pass_roe"] = pass_roe
 
+            # 2. ROIC (均值 >= 12%)
+            ebit = fin.loc["EBIT"] if "EBIT" in fin.index else (fin.loc["Operating Income"] if "Operating Income" in fin.index else net_incomes)
+            nopat = ebit * 0.8
+            total_debt = bs.loc["Total Debt"] if "Total Debt" in bs.index else (bs.loc["Total Liabilities Net Minority Interest"] * 0.5)
+            cash = bs.loc["Cash And Cash Equivalents"] if "Cash And Cash Equivalents" in bs.index else pd.Series(0, index=equity.index)
+            invested_cap = (equity + total_debt - cash).replace(0, np.nan)
+            common_roic_years = nopat.index.intersection(invested_cap.index)
+            roic_series = (nopat[common_roic_years] / invested_cap[common_roic_years]) * 100
+            avg_roic = roic_series.dropna().mean() if not roic_series.dropna().empty else avg_roe * 0.85
+            pass_roic = bool(avg_roic >= 12.0)
+            results["roic_str"] = f"均值 {avg_roic:.1f}%"
+            results["pass_roic"] = pass_roic
+
+            # 3. 負債比率 (< 50%)
+            total_liab = bs.loc["Total Liabilities Net Minority Interest"].iloc[0] if "Total Liabilities Net Minority Interest" in bs.index else 0
+            total_assets = bs.loc["Total Assets"].iloc[0] if "Total Assets" in bs.index else 1
+            debt_ratio = (total_liab / total_assets) * 100 if total_assets > 0 else 0
+            pass_debt = bool(debt_ratio < 50.0)
+            results["debt_str"] = f"{debt_ratio:.1f}%"
+            results["pass_debt"] = pass_debt
+
+            # 4. FCF / 淨利 (>= 80%)
+            op_cash = cf.loc["Operating Cash Flow"] if "Operating Cash Flow" in cf.index else cf.loc["Cash Flow From Continuing Operating Activities"]
+            capex = cf.loc["Capital Expenditure"].abs() if "Capital Expenditure" in cf.index else pd.Series(0, index=op_cash.index)
+            fcf_series = op_cash - capex
+            common_cf_years = fcf_series.index.intersection(net_incomes.index)
+            total_fcf = fcf_series[common_cf_years].sum()
+            total_ni = net_incomes[common_cf_years].sum()
+            fcf_rate = (total_fcf / total_ni) * 100 if total_ni > 0 else 0
+            pass_fcf = bool(fcf_rate >= 80.0)
+            results["fcf_str"] = f"{fcf_rate:.0f}%"
+            results["pass_fcf"] = pass_fcf
+
+            # 5. 毛利率走勢 (持穩/上升)
+            gross_profit = fin.loc["Gross Profit"]
+            total_rev = fin.loc["Total Revenue"]
+            gm_series = (gross_profit / total_rev) * 100
+            latest_gm = gm_series.iloc[0]
+            avg_gm = gm_series.mean()
+            pass_gm = bool(latest_gm >= avg_gm - 1.5)
+            results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
+            results["pass_gm"] = pass_gm
+
+            # 6. PEG <= 1.2 或 PE <= 20
+            pe = info.get("trailingPE", None)
+            results["pe"] = pe
+            rev_start, rev_end = total_rev.iloc[-1], total_rev.iloc[0]
+            n_years = len(total_rev) - 1
+            rev_cagr = (((rev_end / rev_start) ** (1 / n_years)) - 1) * 100 if (rev_start > 0 and n_years > 0) else 0
+            peg = (pe / rev_cagr) if (pe and rev_cagr > 0) else np.nan
+            pass_peg = bool((peg <= 1.2) if not np.isnan(peg) else (pe and pe <= 20.0))
+            results["peg_str"] = f"PEG {peg:.2f}" if not np.isnan(peg) else (f"PE {pe:.1f}x" if pe else "N/A")
+            results["pass_peg"] = pass_peg
+
+            # 7. 盈餘配發率 (35% - 65%)
+            payout_val = info.get("payoutRatio", None)
+            payout_pct = payout_val * 100 if payout_val else None
+            if payout_pct is not None:
+                pass_payout = bool(35.0 <= payout_pct <= 65.0)
+                results["payout_str"] = f"{payout_pct:.1f}%"
+            else:
+                pass_payout = True
+                results["payout_str"] = "約 45%~55%"
+            results["pass_payout"] = pass_payout
+
+            # 8. 毛利變異係數 (CV < 25%)
+            gm_std = gm_series.std()
+            if avg_gm > 0:
+                cv_val = (gm_std / avg_gm) * 100
+                pass_cv = bool(cv_val < 25.0)
+                results["cv_str"] = f"CV {cv_val:.1f}%"
+                results["pass_cv"] = pass_cv
+        except Exception:
+            pass
+
+    # 9. 市場流動性檢驗（近 20 日日均成交金額 >= 3,000 萬 或 日均量 >= 500 張）
     try:
-        # 1. ROE (歷年平均 >= 15%, 低點 >= 8%)
-        net_incomes = fin.loc["Net Income Common Stockholders"] if "Net Income Common Stockholders" in fin.index else fin.loc["Net Income"]
-        equity = bs.loc["Stockholders Equity"] if "Stockholders Equity" in bs.index else bs.loc["Total Equity Gross Minority Interest"]
-        common_years = net_incomes.index.intersection(equity.index)
-        roe_series = (net_incomes[common_years] / equity[common_years]) * 100
-        avg_roe = roe_series.mean()
-        min_roe = roe_series.min()
-        pass_roe = bool((avg_roe >= 15.0) and (min_roe >= 8.0))
-        results["roe_str"] = f"均值 {avg_roe:.1f}% (低點 {min_roe:.1f}%)"
-        results["pass_roe"] = pass_roe
+        if len(df) >= 20:
+            recent_20 = df.iloc[-20:]
+            # 每日成交金額 (元) = 收盤價 * 成交股數
+            daily_turnover = recent_20['Close'] * recent_20['Volume']
+            avg_turnover_m = (daily_turnover.mean()) / 10000000  # 轉為千萬台幣
+            avg_volume_lots = (recent_20['Volume'].mean()) / 1000  # 轉為張數
 
-        # 2. ROIC (均值 >= 12%)
-        ebit = fin.loc["EBIT"] if "EBIT" in fin.index else (fin.loc["Operating Income"] if "Operating Income" in fin.index else net_incomes)
-        nopat = ebit * 0.8
-        total_debt = bs.loc["Total Debt"] if "Total Debt" in bs.index else (bs.loc["Total Liabilities Net Minority Interest"] * 0.5)
-        cash = bs.loc["Cash And Cash Equivalents"] if "Cash And Cash Equivalents" in bs.index else pd.Series(0, index=equity.index)
-        invested_cap = (equity + total_debt - cash).replace(0, np.nan)
-        common_roic_years = nopat.index.intersection(invested_cap.index)
-        roic_series = (nopat[common_roic_years] / invested_cap[common_roic_years]) * 100
-        avg_roic = roic_series.dropna().mean() if not roic_series.dropna().empty else avg_roe * 0.85
-        pass_roic = bool(avg_roic >= 12.0)
-        results["roic_str"] = f"均值 {avg_roic:.1f}%"
-        results["pass_roic"] = pass_roic
-
-        # 3. 負債比率 (< 50%)
-        total_liab = bs.loc["Total Liabilities Net Minority Interest"].iloc[0] if "Total Liabilities Net Minority Interest" in bs.index else 0
-        total_assets = bs.loc["Total Assets"].iloc[0] if "Total Assets" in bs.index else 1
-        debt_ratio = (total_liab / total_assets) * 100 if total_assets > 0 else 0
-        pass_debt = bool(debt_ratio < 50.0)
-        results["debt_str"] = f"{debt_ratio:.1f}%"
-        results["pass_debt"] = pass_debt
-
-        # 4. FCF / 淨利 (>= 80%)
-        op_cash = cf.loc["Operating Cash Flow"] if "Operating Cash Flow" in cf.index else cf.loc["Cash Flow From Continuing Operating Activities"]
-        capex = cf.loc["Capital Expenditure"].abs() if "Capital Expenditure" in cf.index else pd.Series(0, index=op_cash.index)
-        fcf_series = op_cash - capex
-        common_cf_years = fcf_series.index.intersection(net_incomes.index)
-        total_fcf = fcf_series[common_cf_years].sum()
-        total_ni = net_incomes[common_cf_years].sum()
-        fcf_rate = (total_fcf / total_ni) * 100 if total_ni > 0 else 0
-        pass_fcf = bool(fcf_rate >= 80.0)
-        results["fcf_str"] = f"{fcf_rate:.0f}%"
-        results["pass_fcf"] = pass_fcf
-
-        # 5. 毛利率走勢 (持穩/上升)
-        gross_profit = fin.loc["Gross Profit"]
-        total_rev = fin.loc["Total Revenue"]
-        gm_series = (gross_profit / total_rev) * 100
-        latest_gm = gm_series.iloc[0]
-        avg_gm = gm_series.mean()
-        pass_gm = bool(latest_gm >= avg_gm - 1.5)
-        results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
-        results["pass_gm"] = pass_gm
-
-        # 6. PEG <= 1.2 或 PE <= 20
-        pe = info.get("trailingPE", None)
-        results["pe"] = pe
-        rev_start, rev_end = total_rev.iloc[-1], total_rev.iloc[0]
-        n_years = len(total_rev) - 1
-        rev_cagr = (((rev_end / rev_start) ** (1 / n_years)) - 1) * 100 if (rev_start > 0 and n_years > 0) else 0
-        peg = (pe / rev_cagr) if (pe and rev_cagr > 0) else np.nan
-        pass_peg = bool((peg <= 1.2) if not np.isnan(peg) else (pe and pe <= 20.0))
-        results["peg_str"] = f"PEG {peg:.2f}" if not np.isnan(peg) else (f"PE {pe:.1f}x" if pe else "N/A")
-        results["pass_peg"] = pass_peg
-
-        # 7. 盈餘配發率 (35% - 65%)
-        payout_val = info.get("payoutRatio", None)
-        payout_pct = payout_val * 100 if payout_val else None
-        if payout_pct is not None:
-            pass_payout = bool(35.0 <= payout_pct <= 65.0)
-            results["payout_str"] = f"{payout_pct:.1f}%"
-        else:
-            pass_payout = True
-            results["payout_str"] = "約 45%~55%"
-        results["pass_payout"] = pass_payout
-
-        # 8. 毛利率變異係數 (CV < 25%，排除景氣循環劇烈波動)
-        gm_std = gm_series.std()
-        if avg_gm > 0:
-            cv_val = (gm_std / avg_gm) * 100
-            pass_cv = bool(cv_val < 25.0)
-            results["cv_str"] = f"CV {cv_val:.1f}% (標準差 {gm_std:.1f}%)"
-            results["pass_cv"] = pass_cv
-        else:
-            results["cv_str"] = "毛利異常"
-            results["pass_cv"] = False
-
-        results["pass_count"] = sum([
-            pass_roe, pass_roic, pass_debt, pass_fcf,
-            pass_gm, pass_peg, pass_payout, results["pass_cv"]
-        ])
-
+            pass_liq = bool((avg_turnover_m >= 3.0) or (avg_volume_lots >= 500.0))
+            results["liq_str"] = f"日均 {avg_turnover_m:.1f}千萬 ({int(avg_volume_lots)}張)"
+            results["pass_liq"] = pass_liq
     except Exception:
-        pass
+        results["liq_str"] = "計算失敗"
+        results["pass_liq"] = False
 
+    results["pass_count"] = sum([
+        results["pass_roe"], results["pass_roic"], results["pass_debt"], results["pass_fcf"],
+        results["pass_gm"], results["pass_peg"], results["pass_payout"], results["pass_cv"],
+        results["pass_liq"]
+    ])
     return results
 
 def calculate_valuation_bands(curr_price, pe, target_mean):
     """計算便宜價、合理價、昂貴價及當前所處位階"""
     eps = (curr_price / pe) if (pe and pe > 0) else None
 
-    # 模型 A：本益比歷史位階
     if eps and eps > 0:
         cheap_pe = eps * 14.0
         fair_pe = eps * 18.0
@@ -188,7 +199,6 @@ def calculate_valuation_bands(curr_price, pe, target_mean):
     else:
         cheap_pe, fair_pe, expensive_pe = None, None, None
 
-    # 模型 B：法人目標價折價（安全邊際）
     if target_mean and target_mean > 0:
         cheap_target = target_mean * 0.78
         fair_target = target_mean * 0.88
@@ -196,7 +206,6 @@ def calculate_valuation_bands(curr_price, pe, target_mean):
     else:
         cheap_target, fair_target, expensive_target = None, None, None
 
-    # 綜合加權估值
     if cheap_target and cheap_pe:
         cheap_val = round(cheap_target * 0.6 + cheap_pe * 0.4, 2)
         fair_val = round(fair_target * 0.6 + fair_pe * 0.4, 2)
@@ -251,7 +260,7 @@ def generate_stock_report(code: str) -> str:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 技術面與雙日確認指標計算
+    # 技術面指標
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
@@ -265,7 +274,7 @@ def generate_stock_report(code: str) -> str:
     recent_low_60 = float(df['Low'].iloc[-60:].min())
     recent_low_20 = float(df['Low'].iloc[-20:].min())
 
-    # 雙日收盤價跌破季線確認邏輯
+    # 雙日跌破確認邏輯
     today_below_ma60 = close_today < ma60_today
     yesterday_below_ma60 = close_yesterday < ma60_yesterday
     consecutive_2day_breakdown = today_below_ma60 and yesterday_below_ma60
@@ -275,14 +284,14 @@ def generate_stock_report(code: str) -> str:
     if consecutive_2day_breakdown:
         breakdown_status = "🔴 連續 2 日收盤跌破季線（實體跌破確認，觸發停損/減碼防守）"
     elif single_day_breakdown:
-        breakdown_status = "🟡 首日收盤跌破季線（列入警戒觀察，切勿恐慌殺低，待次日收盤確認）"
+        breakdown_status = "🟡 首日收盤跌破季線（列入警戒觀察，待次日收盤確認）"
     else:
         breakdown_status = "🟢 穩居 60MA 季線之上（長線多頭架構完好）"
 
-    # 八大體質檢驗
+    # 九大體質檢驗
     stock = yf.Ticker(ticker, session=session)
     info = stock.info if hasattr(stock, "info") else {}
-    fund = evaluate_eight_fundamentals(stock, info)
+    fund = evaluate_nine_fundamentals(stock, info, df)
     score = fund["pass_count"]
 
     # 法人目標價
@@ -313,8 +322,12 @@ def generate_stock_report(code: str) -> str:
     tp_tier1 = round(target_mean, 2) if has_target else round(val_bands["fair"] * 1.15, 2)
     tp_tier2 = round(max(target_high if has_target else 0, val_bands["expensive"]), 2)
 
-    # 教練決策引擎（整合 8 項體質 + 雙日確認 + 估值區間）
-    if consecutive_2day_breakdown:
+    # 教練決策引擎（加入流動性門檻判斷）
+    if not fund["pass_liq"]:
+        status_state = "流動性不足預警（日均額不足 3,000 萬 / 均量小於 500 張）"
+        coach_signal = "⚠️ 慎防流動性風險 / 不宜大額建倉"
+        action_plan = f"該標的近 20 日市場交投較冷清 ({fund['liq_str']})，遇急跌恐面臨滑價或難以快速變現。若要配置，單筆資金切勿超過總資產 5%。"
+    elif consecutive_2day_breakdown:
         status_state = "破線轉弱格局（連續兩日收盤跌破季線）"
         coach_signal = "⚫ 停損離場 / 減碼避開"
         action_plan = "已觸發【雙日收盤跌破季線】之硬性風控條件，消除假跌破疑慮。長線資金應嚴格保護本金，執行停損或將資金轉往防禦配置。"
@@ -330,14 +343,14 @@ def generate_stock_report(code: str) -> str:
         status_state = "估值過熱區間（高於昂貴價 / 超越目標價）"
         coach_signal = "🔴 分批獲利了結"
         action_plan = f"現價處於昂貴價 ({val_bands['expensive']} 元) 之上，風險收益比轉差，建議在第一/第二目標位逐步減碼 1/3 ~ 1/2 鎖定利潤。"
-    elif score >= 6 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and above_ma60:
+    elif score >= 7 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and above_ma60:
         status_state = "黃金共振進場（頂級護城河 ＋ 估值具安全邊際 ＋ 季線支撐）"
         coach_signal = "🟢 強力買進 / 積極分批"
-        action_plan = f"八大體質拿下 {score}/8 高分（通過週期過濾），落入【{val_bands['zone_status'].split('（')[0]}】。建議落實 30%(現價) / 40%(回測月線止跌) / 30%(突破季線) 分批建倉。"
-    elif score >= 5 and above_ma60:
+        action_plan = f"九大指標拿下 {score}/9 高分（流動性充裕且通過週期過濾），落入【{val_bands['zone_status'].split('（')[0]}】。建議落實 30%(現價) / 40%(回測月線止跌) / 30%(突破季線) 分批建倉。"
+    elif score >= 6 and above_ma60:
         status_state = "多頭穩健推進（基本面良好 ＋ 趨勢健康）"
         coach_signal = "🟡 逢低承接 / 續抱觀察"
-        action_plan = f"體質評分良好 ({score}/8) 且季線支撐明確。原有部位續抱；欲加碼者等待股價拉回月線 ({ma20_today:.2f} 元) 出現右側止跌紅 K 再行介入。"
+        action_plan = f"體質評分良好 ({score}/9) 且季線支撐明確。原有部位續抱；欲加碼者等待股價拉回月線 ({ma20_today:.2f} 元) 出現右側止跌紅 K 再行介入。"
     else:
         status_state = "盤整待變 / 競爭優勢不明顯"
         coach_signal = "🟠 觀望等待"
@@ -355,7 +368,7 @@ def generate_stock_report(code: str) -> str:
         f"📊 **【 {company_name} ({code}) 長線全方位深度診斷】**\n"
         f"────────────────────────\n"
         f"📌 現價：`{close_today:.2f} 元` | 月線：`{ma20_today:.2f}` | 季線：`{ma60_today:.2f}`\n\n"
-        f"🏛️ **一、長線八大核心體質檢驗 ({score}/8 通過)**\n"
+        f"🏛️ **一、長線九大核心體質檢驗 ({score}/9 通過)**\n"
         f"1. ROE (均≧15%,低≧8%): {fund['roe_str']} ({'✅' if fund['pass_roe'] else '❌'})\n"
         f"2. ROIC (均≧12%): {fund['roic_str']} ({'✅' if fund['pass_roic'] else '❌'})\n"
         f"3. 負債比率 (<50%): {fund['debt_str']} ({'✅' if fund['pass_debt'] else '❌'})\n"
@@ -363,7 +376,8 @@ def generate_stock_report(code: str) -> str:
         f"5. 毛利率走勢 (持穩/上升): {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'})\n"
         f"6. 估值比 (PEG≦1.2/合理): {fund['peg_str']} ({'✅' if fund['pass_peg'] else '⚠️'})\n"
         f"7. 盈餘配發率 (35%-65%): {fund['payout_str']} ({'✅' if fund['pass_payout'] else '⚠️'})\n"
-        f"8. 毛利變異係數 (CV<25% 防週期): {fund['cv_str']} ({'✅' if fund['pass_cv'] else '❌ 週期波動大'})\n\n"
+        f"8. 毛利變異係數 (CV<25% 防週期): {fund['cv_str']} ({'✅' if fund['pass_cv'] else '❌ 週期波動大'})\n"
+        f"9. 市場流動性 (日均≧3千萬/500張): {fund['liq_str']} ({'✅' if fund['pass_liq'] else '⚠️ 流動性偏低'})\n\n"
         f"🏷️ **二、長線合理價格區間評估**\n"
         f"• 便宜價（安全邊際）：`{val_bands['cheap']} 元`\n"
         f"• 合理價（公允價值）：`{val_bands['fair']} 元`\n"
@@ -416,7 +430,7 @@ async def on_message(message):
 
     if len(user_text) == 4 and user_text.isdigit():
         stock_name = get_tw_stock_name(user_text)
-        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行八大體質檢驗與雙日跌破風控精算，請稍候約 3~5 秒...")
+        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行九大體質檢驗與雙日跌破風控精算，請稍候約 3~5 秒...")
         try:
             report = await asyncio.to_thread(generate_stock_report, user_text)
             await wait_msg.edit(content=report)
