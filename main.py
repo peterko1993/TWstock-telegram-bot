@@ -55,7 +55,7 @@ def fetch_tw_analyst_targets(code: str):
         return None
 
 def evaluate_nine_fundamentals(stock, info, df, close_today):
-    """計算並檢驗九大長線核心基本面（實裝財報自主精算 EPS 與 PE）"""
+    """計算並檢驗九大長線核心基本面（實裝 100% 自主精算 PEG 引擎）"""
     results = {
         "pass_count": 0,
         "roe_str": "資料暫缺", "pass_roe": False,
@@ -77,7 +77,7 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
         cf = stock.cashflow
         
         if not (fin.empty or bs.empty or cf.empty or fin.shape[1] < 3):
-            # 1. ROE
+            # 1. ROE (均值 >= 15%, 低點 >= 8%)
             net_incomes = fin.loc["Net Income Common Stockholders"] if "Net Income Common Stockholders" in fin.index else fin.loc["Net Income"]
             equity = bs.loc["Stockholders Equity"] if "Stockholders Equity" in bs.index else bs.loc["Total Equity Gross Minority Interest"]
             common_years = net_incomes.index.intersection(equity.index)
@@ -88,7 +88,7 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
             results["roe_str"] = f"均值 {avg_roe:.1f}% (低點 {min_roe:.1f}%)"
             results["pass_roe"] = pass_roe
 
-            # 2. ROIC
+            # 2. ROIC (均值 >= 12%)
             ebit = fin.loc["EBIT"] if "EBIT" in fin.index else (fin.loc["Operating Income"] if "Operating Income" in fin.index else net_incomes)
             nopat = ebit * 0.8
             total_debt = bs.loc["Total Debt"] if "Total Debt" in bs.index else (bs.loc["Total Liabilities Net Minority Interest"] * 0.5)
@@ -101,7 +101,7 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
             results["roic_str"] = f"均值 {avg_roic:.1f}%"
             results["pass_roic"] = pass_roic
 
-            # 3. 負債比率
+            # 3. 負債比率 (< 50%)
             total_liab = bs.loc["Total Liabilities Net Minority Interest"].iloc[0] if "Total Liabilities Net Minority Interest" in bs.index else 0
             total_assets = bs.loc["Total Assets"].iloc[0] if "Total Assets" in bs.index else 1
             debt_ratio = (total_liab / total_assets) * 100 if total_assets > 0 else 0
@@ -109,7 +109,7 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
             results["debt_str"] = f"{debt_ratio:.1f}%"
             results["pass_debt"] = pass_debt
 
-            # 4. FCF / 淨利
+            # 4. FCF / 淨利 (>= 80%)
             op_cash = cf.loc["Operating Cash Flow"] if "Operating Cash Flow" in cf.index else cf.loc["Cash Flow From Continuing Operating Activities"]
             capex = cf.loc["Capital Expenditure"].abs() if "Capital Expenditure" in cf.index else pd.Series(0, index=op_cash.index)
             fcf_series = op_cash - capex
@@ -131,55 +131,78 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
             results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
             results["pass_gm"] = pass_gm
 
-            # 6. 自主精算 EPS、本益比 (PE) 與 PEG
-            for eps_col in ["Diluted EPS", "Basic EPS"]:
-                if eps_col in fin.index:
-                    val = fin.loc[eps_col].iloc[0]
-                    if not np.isnan(val) and val != 0:
+            # ================= 6. 100% 自主精算 PEG (彼得·林區模型) =================
+            # (1) 取得最新 EPS
+            for eps_key in ["Diluted EPS", "Basic EPS", "Diluted Normalized EPS"]:
+                if eps_key in fin.index:
+                    val = fin.loc[eps_key].iloc[0]
+                    if pd.notna(val) and float(val) != 0:
                         eps = float(val)
                         break
             
-            # 若無現成 EPS 欄位，以「最新淨利 / 股數」推算
             if eps is None or eps <= 0:
                 try:
-                    shares = getattr(stock.fast_info, 'shares', None)
-                    if not shares or np.isnan(shares):
+                    shares = None
+                    if hasattr(stock, 'fast_info') and hasattr(stock.fast_info, 'shares'):
+                        shares = stock.fast_info.shares
+                    if not shares or pd.isna(shares):
                         for cap_key in ["Common Stock", "Capital Stock", "Ordinary Shares Number"]:
                             if cap_key in bs.index:
                                 cap_val = bs.loc[cap_key].iloc[0]
-                                if not np.isnan(cap_val) and cap_val > 0:
-                                    shares = cap_val / 10.0 if cap_key != "Ordinary Shares Number" else cap_val
+                                if pd.notna(cap_val) and float(cap_val) > 0:
+                                    shares = (cap_val / 10.0) if cap_key != "Ordinary Shares Number" else cap_val
                                     break
                     if shares and shares > 0:
-                        latest_ni = net_incomes.iloc[0]
-                        eps = float(latest_ni / shares)
+                        eps = float(net_incomes.iloc[0] / shares)
                 except Exception:
                     pass
 
-            # 計算 PE
             pe = round(close_today / eps, 2) if (eps and eps > 0) else None
-            if pe is None and info.get("trailingPE"):
-                pe = float(info["trailingPE"])
             results["pe"] = pe
 
-            # 計算營收 CAGR 與 PEG
-            rev_start, rev_end = total_rev.iloc[-1], total_rev.iloc[0]
-            n_years = len(total_rev) - 1
-            rev_cagr = (((rev_end / rev_start) ** (1 / n_years)) - 1) * 100 if (rev_start > 0 and n_years > 0) else 0
+            # (2) 計算年化複合成長率 G (CAGR)
+            n_years = len(fin.columns) - 1
+            if n_years > 0:
+                ni_latest = float(net_incomes.iloc[0])
+                ni_oldest = float(net_incomes.iloc[-1])
+                g_ni = (((ni_latest / ni_oldest) ** (1 / n_years)) - 1) * 100 if (ni_latest > 0 and ni_oldest > 0) else None
 
-            if pe and pe > 0:
-                if rev_cagr > 3.0:
-                    peg = pe / rev_cagr
-                    pass_peg = (peg <= 1.2) or (pe <= 20.0)
-                    results["peg_str"] = f"PEG {peg:.2f} (PE {pe:.1f}x)"
-                    results["pass_peg"] = bool(pass_peg)
+                rev_latest = float(total_rev.iloc[0])
+                rev_oldest = float(total_rev.iloc[-1])
+                g_rev = (((rev_latest / rev_oldest) ** (1 / n_years)) - 1) * 100 if (rev_latest > 0 and rev_oldest > 0) else None
+
+                # 決定綜合成長率 G
+                if g_ni is not None and 0 < g_ni <= 80:
+                    growth_rate = g_ni
+                    g_label = "淨利"
+                elif g_ni is not None and g_ni > 80 and g_rev and g_rev > 0:
+                    # 避免低基期導致成長率失真，取淨利與營收平均
+                    growth_rate = (g_ni + g_rev) / 2
+                    g_label = "綜合"
+                elif g_rev is not None and g_rev > 0:
+                    growth_rate = g_rev
+                    g_label = "營收"
+                elif g_ni is not None:
+                    growth_rate = g_ni
+                    g_label = "淨利"
                 else:
-                    # 營收持平或平緩時，直接由 PE 是否處於 20 倍內合理區間判定
-                    pass_peg = (pe <= 20.0)
-                    results["peg_str"] = f"PE {pe:.1f}x ({'合理' if pass_peg else '偏高'})"
-                    results["pass_peg"] = bool(pass_peg)
+                    growth_rate = 0.0
+                    g_label = "無"
             else:
-                results["peg_str"] = "獲利虧損/暫缺"
+                growth_rate = 0.0
+                g_label = "無"
+
+            # (3) 判定 PEG <= 1.2
+            if pe and pe > 0 and growth_rate > 0:
+                peg = round(pe / growth_rate, 2)
+                pass_peg = bool(peg <= 1.2)
+                results["peg_str"] = f"PEG {peg:.2f} ({g_label}G:{growth_rate:.1f}%, PE:{pe:.1f}x)"
+                results["pass_peg"] = pass_peg
+            elif pe and pe > 0 and growth_rate <= 0:
+                results["peg_str"] = f"衰退無效 ({g_label}G:{growth_rate:.1f}%, PE:{pe:.1f}x)"
+                results["pass_peg"] = False
+            else:
+                results["peg_str"] = "獲利虧損/無法計算"
                 results["pass_peg"] = False
 
             # 7. 盈餘配發率
@@ -350,7 +373,7 @@ def generate_stock_report(code: str) -> str:
     except Exception:
         pass
 
-    # 將當前股價傳入，用於自主精算 PE
+    # 自主計算基本面（含專屬 PEG 引擎）
     fund = evaluate_nine_fundamentals(stock, info, df, close_today)
     score = fund["pass_count"]
 
@@ -370,7 +393,7 @@ def generate_stock_report(code: str) -> str:
 
     target_upside = ((target_mean - close_today) / close_today) * 100 if has_target else 0.0
 
-    # 價格區間計算
+    # 價格區間計算（使用自主精算出的 PE，精準度提升）
     val_bands = calculate_valuation_bands(close_today, fund["pe"], target_mean)
 
     # 技術關鍵價位
@@ -450,7 +473,7 @@ def generate_stock_report(code: str) -> str:
         f"🏛️ **一、長線九大核心體質 ({score}/9 通過)**\n"
         f"• ROE: {fund['roe_str']} ({'✅' if fund['pass_roe'] else '❌'}) | ROIC: {fund['roic_str']} ({'✅' if fund['pass_roic'] else '❌'})\n"
         f"• 負債比: {fund['debt_str']} ({'✅' if fund['pass_debt'] else '❌'}) | 現金流率: {fund['fcf_str']} ({'✅' if fund['pass_fcf'] else '⚠️'})\n"
-        f"• 毛利率: {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'}) | 估值: {fund['peg_str']} ({'✅' if fund['pass_peg'] else '⚠️'})\n"
+        f"• 毛利率: {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'}) | PEG估值: {fund['peg_str']} ({'✅' if fund['pass_peg'] else '❌'})\n"
         f"• 配發率: {fund['payout_str']} ({'✅' if fund['pass_payout'] else '⚠️'}) | CV防週期: {fund['cv_str']} ({'✅' if fund['pass_cv'] else '❌'})\n"
         f"• 市場流動性: {fund['liq_str']} ({'✅' if fund['pass_liq'] else '⚠️'})\n\n"
         f"🏷️ **二、長線合理價格區間與目標價**\n"
