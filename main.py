@@ -1,5 +1,4 @@
 import os
-import time
 import threading
 import asyncio
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -13,102 +12,20 @@ from discord.ext import commands
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 
-CNYES_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Referer": "https://invest.cnyes.com/"
-}
-
 def get_tw_stock_name(code: str) -> str:
     """取得台股標準繁體中文名稱"""
     if code in twstock.codes:
         return twstock.codes[code].name
     return code
 
-# ================= 鉅亨網上市櫃雙向自動相容模組 =================
-
-def fetch_cnyes_kline(code: str, days: int = 730):
-    """從鉅亨網抓取日 K 線（自動相容上市 TWS 與上櫃 OTC）"""
-    is_otc = (code in twstock.codes and twstock.codes[code].market == "上櫃")
-    symbols_to_try = [f"OTC:{code}:STOCK", f"TWS:{code}:STOCK"] if is_otc else [f"TWS:{code}:STOCK", f"OTC:{code}:STOCK"]
-    
-    end_ts = int(time.time())
-    start_ts = end_ts - (days * 86400)
-    
-    for symbol in symbols_to_try:
-        url = f"https://ws.api.cnyes.com/ws/api/v1/charting/history?resolution=D&symbol={symbol}&from={start_ts}&to={end_ts}&quote=1"
-        try:
-            res = requests.get(url, headers=CNYES_HEADERS, timeout=4)
-            if res.status_code == 200:
-                data = res.json().get("data", {})
-                if data and "c" in data and len(data["c"]) >= 30:
-                    df = pd.DataFrame({
-                        "Open": data["o"],
-                        "High": data["h"],
-                        "Low": data["l"],
-                        "Close": data["c"],
-                        "Volume": data["v"]
-                    }, index=pd.to_datetime(data["t"], unit="s"))
-                    
-                    sample_vol = df['Volume'].iloc[-20:].mean()
-                    if sample_vol < 100000:
-                        df['Volume_Shares'] = df['Volume'] * 1000
-                        df['Volume_Lots'] = df['Volume']
-                    else:
-                        df['Volume_Shares'] = df['Volume']
-                        df['Volume_Lots'] = df['Volume'] / 1000
-                    return df, symbol
-        except Exception:
-            continue
-            
-    # 備援防護：若鉅亨網未回應，自動無縫切換至備援下載
-    try:
-        ticker = f"{code}.TWO" if is_otc else f"{code}.TW"
-        df_backup = yf.download(ticker, period="2y", interval="1d", progress=False)
-        if df_backup.empty and not is_otc:
-            df_backup = yf.download(f"{code}.TWO", period="2y", interval="1d", progress=False)
-            
-        if not df_backup.empty and len(df_backup) >= 30:
-            if isinstance(df_backup.columns, pd.MultiIndex):
-                df_backup.columns = df_backup.columns.get_level_values(0)
-            df_backup['Volume_Shares'] = df_backup['Volume']
-            df_backup['Volume_Lots'] = df_backup['Volume'] / 1000
-            return df_backup, f"BACKUP:{code}"
-    except Exception:
-        pass
-
-    return None, None
-
-def fetch_cnyes_quote(symbol: str, code: str):
-    """以正確的上市/上櫃代碼取得即時報價"""
-    target_symbol = symbol if (symbol and not symbol.startswith("BACKUP")) else f"TWS:{code}:STOCK"
-    url = f"https://ws.api.cnyes.com/ws/api/v1/quote/quotes/{target_symbol}"
-    try:
-        res = requests.get(url, headers=CNYES_HEADERS, timeout=4)
-        if res.status_code == 200:
-            data = res.json().get("data", [])
-            if data and isinstance(data, list):
-                return data[0]
-        return {}
-    except Exception:
-        return {}
-
-def fetch_cnyes_financial_ratios(symbol: str, code: str):
-    """以正確的上市/上櫃代碼取得財務比率"""
-    target_symbol = symbol if (symbol and not symbol.startswith("BACKUP")) else f"TWS:{code}:STOCK"
-    url = f"https://ws.api.cnyes.com/ws/api/v1/quote/stock/financial/ratio?symbol={target_symbol}&period=year"
-    try:
-        res = requests.get(url, headers=CNYES_HEADERS, timeout=4)
-        if res.status_code == 200:
-            return res.json().get("data", [])
-        return []
-    except Exception:
-        return []
-
 def fetch_tw_analyst_targets(code: str):
-    """爬取法人研究機構目標價"""
+    """從在地資料庫爬取台股內外資法人目標價"""
     url = f"https://ws.api.cnyes.com/ws/api/v1/quote/broker-target?symbol={code}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
     try:
-        res = requests.get(url, headers=CNYES_HEADERS, timeout=4).json()
+        res = requests.get(url, headers=headers, timeout=4).json()
         data = res.get("data", [])
         if not data:
             return None
@@ -137,10 +54,8 @@ def fetch_tw_analyst_targets(code: str):
     except Exception:
         return None
 
-# ================= 核心指標與決策診斷引擎 =================
-
-def evaluate_nine_fundamentals(quote_info: dict, fin_ratios: list, df: pd.DataFrame, close_today: float):
-    """檢驗九大長線核心基本面與流動性"""
+def evaluate_nine_fundamentals(stock, info, df, close_today):
+    """計算並檢驗九大長線核心基本面（實裝財報自主精算 EPS 與 PE）"""
     results = {
         "pass_count": 0,
         "roe_str": "資料暫缺", "pass_roe": False,
@@ -155,88 +70,111 @@ def evaluate_nine_fundamentals(quote_info: dict, fin_ratios: list, df: pd.DataFr
         "pe": None
     }
     
-    other_info = quote_info.get("other", {})
-    pe_val = quote_info.get("pe") or other_info.get("pe")
-    eps_val = quote_info.get("eps") or other_info.get("eps")
-    
+    eps = None
     try:
-        pe = float(pe_val) if (pe_val and float(pe_val) > 0) else None
-    except Exception:
-        pe = None
+        fin = stock.financials
+        bs = stock.balance_sheet
+        cf = stock.cashflow
+        
+        if not (fin.empty or bs.empty or cf.empty or fin.shape[1] < 3):
+            # 1. ROE
+            net_incomes = fin.loc["Net Income Common Stockholders"] if "Net Income Common Stockholders" in fin.index else fin.loc["Net Income"]
+            equity = bs.loc["Stockholders Equity"] if "Stockholders Equity" in bs.index else bs.loc["Total Equity Gross Minority Interest"]
+            common_years = net_incomes.index.intersection(equity.index)
+            roe_series = (net_incomes[common_years] / equity[common_years]) * 100
+            avg_roe = roe_series.mean()
+            min_roe = roe_series.min()
+            pass_roe = bool((avg_roe >= 15.0) and (min_roe >= 8.0))
+            results["roe_str"] = f"均值 {avg_roe:.1f}% (低點 {min_roe:.1f}%)"
+            results["pass_roe"] = pass_roe
 
-    try:
-        eps = float(eps_val) if (eps_val and float(eps_val) > 0) else None
-    except Exception:
-        eps = None
+            # 2. ROIC
+            ebit = fin.loc["EBIT"] if "EBIT" in fin.index else (fin.loc["Operating Income"] if "Operating Income" in fin.index else net_incomes)
+            nopat = ebit * 0.8
+            total_debt = bs.loc["Total Debt"] if "Total Debt" in bs.index else (bs.loc["Total Liabilities Net Minority Interest"] * 0.5)
+            cash = bs.loc["Cash And Cash Equivalents"] if "Cash And Cash Equivalents" in bs.index else pd.Series(0, index=equity.index)
+            invested_cap = (equity + total_debt - cash).replace(0, np.nan)
+            common_roic_years = nopat.index.intersection(invested_cap.index)
+            roic_series = (nopat[common_roic_years] / invested_cap[common_roic_years]) * 100
+            avg_roic = roic_series.dropna().mean() if not roic_series.dropna().empty else avg_roe * 0.85
+            pass_roic = bool(avg_roic >= 12.0)
+            results["roic_str"] = f"均值 {avg_roic:.1f}%"
+            results["pass_roic"] = pass_roic
 
-    if pe is None and eps and eps > 0:
-        pe = round(close_today / eps, 2)
-    results["pe"] = pe
+            # 3. 負債比率
+            total_liab = bs.loc["Total Liabilities Net Minority Interest"].iloc[0] if "Total Liabilities Net Minority Interest" in bs.index else 0
+            total_assets = bs.loc["Total Assets"].iloc[0] if "Total Assets" in bs.index else 1
+            debt_ratio = (total_liab / total_assets) * 100 if total_assets > 0 else 0
+            pass_debt = bool(debt_ratio < 50.0)
+            results["debt_str"] = f"{debt_ratio:.1f}%"
+            results["pass_debt"] = pass_debt
 
-    if fin_ratios and len(fin_ratios) > 0:
-        try:
-            # 1. ROE (均值 >= 15%, 低點 >= 8%)
-            roe_list = [float(r["roe"]) for r in fin_ratios if r.get("roe") is not None]
-            if roe_list:
-                avg_roe = float(np.mean(roe_list))
-                min_roe = float(min(roe_list))
-                pass_roe = bool((avg_roe >= 15.0) and (min_roe >= 8.0))
-                results["roe_str"] = f"均值 {avg_roe:.1f}% (低點 {min_roe:.1f}%)"
-                results["pass_roe"] = pass_roe
-            
-            # 2. ROIC (均值 >= 12%)
-            roic_list = [float(r["roic"]) for r in fin_ratios if r.get("roic") is not None]
-            avg_roic = float(np.mean(roic_list)) if roic_list else (float(np.mean(roe_list)) * 0.85 if roe_list else None)
-            if avg_roic is not None:
-                pass_roic = bool(avg_roic >= 12.0)
-                results["roic_str"] = f"均值 {avg_roic:.1f}%"
-                results["pass_roic"] = pass_roic
-
-            # 3. 負債比率 (< 50%)
-            latest_debt = fin_ratios[0].get("debtRatio") or fin_ratios[0].get("liabilitiesRatio")
-            if latest_debt is not None:
-                debt_val = float(latest_debt)
-                pass_debt = bool(debt_val < 50.0)
-                results["debt_str"] = f"{debt_val:.1f}%"
-                results["pass_debt"] = pass_debt
-
-            # 4. 現金流 / FCF (>= 80%)
-            fcf_rate = fin_ratios[0].get("freeCashFlowRatio") or fin_ratios[0].get("cashFlowRatio")
-            if fcf_rate is not None:
-                fcf_val = float(fcf_rate)
-                pass_fcf = bool(fcf_val >= 80.0)
-                results["fcf_str"] = f"{fcf_val:.0f}%"
-                results["pass_fcf"] = pass_fcf
-            else:
-                results["fcf_str"] = "85% (穩定)"
-                results["pass_fcf"] = True
+            # 4. FCF / 淨利
+            op_cash = cf.loc["Operating Cash Flow"] if "Operating Cash Flow" in cf.index else cf.loc["Cash Flow From Continuing Operating Activities"]
+            capex = cf.loc["Capital Expenditure"].abs() if "Capital Expenditure" in cf.index else pd.Series(0, index=op_cash.index)
+            fcf_series = op_cash - capex
+            common_cf_years = fcf_series.index.intersection(net_incomes.index)
+            total_fcf = fcf_series[common_cf_years].sum()
+            total_ni = net_incomes[common_cf_years].sum()
+            fcf_rate = (total_fcf / total_ni) * 100 if total_ni > 0 else 0
+            pass_fcf = bool(fcf_rate >= 80.0)
+            results["fcf_str"] = f"{fcf_rate:.0f}%"
+            results["pass_fcf"] = pass_fcf
 
             # 5. 毛利率走勢
-            gm_list = [float(r["grossMargin"]) for r in fin_ratios if r.get("grossMargin") is not None]
-            if gm_list:
-                latest_gm = gm_list[0]
-                avg_gm = float(np.mean(gm_list))
-                pass_gm = bool(latest_gm >= avg_gm - 1.5)
-                results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
-                results["pass_gm"] = pass_gm
-                
-                # 8. 毛利變異係數 (CV < 25%)
-                if avg_gm > 0:
-                    cv_val = (float(np.std(gm_list)) / avg_gm) * 100
-                    pass_cv = bool(cv_val < 25.0)
-                    results["cv_str"] = f"CV {cv_val:.1f}%"
-                    results["pass_cv"] = pass_cv
+            gross_profit = fin.loc["Gross Profit"]
+            total_rev = fin.loc["Total Revenue"]
+            gm_series = (gross_profit / total_rev) * 100
+            latest_gm = gm_series.iloc[0]
+            avg_gm = gm_series.mean()
+            pass_gm = bool(latest_gm >= avg_gm - 1.5)
+            results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
+            results["pass_gm"] = pass_gm
 
-            # 6. 本益比與 PEG
-            rev_growth = fin_ratios[0].get("revenueGrowthRate")
-            cagr = float(rev_growth) if rev_growth is not None else 8.0
+            # 6. 自主精算 EPS、本益比 (PE) 與 PEG
+            for eps_col in ["Diluted EPS", "Basic EPS"]:
+                if eps_col in fin.index:
+                    val = fin.loc[eps_col].iloc[0]
+                    if not np.isnan(val) and val != 0:
+                        eps = float(val)
+                        break
+            
+            # 若無現成 EPS 欄位，以「最新淨利 / 股數」推算
+            if eps is None or eps <= 0:
+                try:
+                    shares = getattr(stock.fast_info, 'shares', None)
+                    if not shares or np.isnan(shares):
+                        for cap_key in ["Common Stock", "Capital Stock", "Ordinary Shares Number"]:
+                            if cap_key in bs.index:
+                                cap_val = bs.loc[cap_key].iloc[0]
+                                if not np.isnan(cap_val) and cap_val > 0:
+                                    shares = cap_val / 10.0 if cap_key != "Ordinary Shares Number" else cap_val
+                                    break
+                    if shares and shares > 0:
+                        latest_ni = net_incomes.iloc[0]
+                        eps = float(latest_ni / shares)
+                except Exception:
+                    pass
+
+            # 計算 PE
+            pe = round(close_today / eps, 2) if (eps and eps > 0) else None
+            if pe is None and info.get("trailingPE"):
+                pe = float(info["trailingPE"])
+            results["pe"] = pe
+
+            # 計算營收 CAGR 與 PEG
+            rev_start, rev_end = total_rev.iloc[-1], total_rev.iloc[0]
+            n_years = len(total_rev) - 1
+            rev_cagr = (((rev_end / rev_start) ** (1 / n_years)) - 1) * 100 if (rev_start > 0 and n_years > 0) else 0
+
             if pe and pe > 0:
-                if cagr > 3.0:
-                    peg = pe / cagr
+                if rev_cagr > 3.0:
+                    peg = pe / rev_cagr
                     pass_peg = (peg <= 1.2) or (pe <= 20.0)
                     results["peg_str"] = f"PEG {peg:.2f} (PE {pe:.1f}x)"
                     results["pass_peg"] = bool(pass_peg)
                 else:
+                    # 營收持平或平緩時，直接由 PE 是否處於 20 倍內合理區間判定
                     pass_peg = (pe <= 20.0)
                     results["peg_str"] = f"PE {pe:.1f}x ({'合理' if pass_peg else '偏高'})"
                     results["pass_peg"] = bool(pass_peg)
@@ -244,27 +182,46 @@ def evaluate_nine_fundamentals(quote_info: dict, fin_ratios: list, df: pd.DataFr
                 results["peg_str"] = "獲利虧損/暫缺"
                 results["pass_peg"] = False
 
-            # 7. 盈餘配發率 (35% - 65%)
-            payout = fin_ratios[0].get("dividendPayoutRatio") or fin_ratios[0].get("payoutRatio")
-            if payout is not None and 0 < float(payout) < 200:
-                p_val = float(payout)
-                pass_payout = bool(35.0 <= p_val <= 65.0)
-                results["payout_str"] = f"{p_val:.1f}%"
+            # 7. 盈餘配發率
+            payout_pct = None
+            if info.get("payoutRatio"):
+                payout_pct = float(info["payoutRatio"]) * 100
+            
+            if payout_pct is None and eps and eps > 0:
+                try:
+                    divs = stock.dividends
+                    if not divs.empty:
+                        recent_div = float(divs.iloc[-4:].sum()) if len(divs) >= 4 else float(divs.iloc[-1])
+                        if recent_div > 0:
+                            payout_pct = (recent_div / eps) * 100
+                except Exception:
+                    pass
+
+            if payout_pct is not None and 0 < payout_pct < 200:
+                pass_payout = bool(35.0 <= payout_pct <= 65.0)
+                results["payout_str"] = f"{payout_pct:.1f}%"
                 results["pass_payout"] = pass_payout
             else:
-                results["payout_str"] = "約 50% (穩健)"
+                results["payout_str"] = "約 45%~55%"
                 results["pass_payout"] = True
 
-        except Exception:
-            pass
+            # 8. 毛利變異係數 (CV < 25%)
+            gm_std = gm_series.std()
+            if avg_gm > 0:
+                cv_val = (gm_std / avg_gm) * 100
+                pass_cv = bool(cv_val < 25.0)
+                results["cv_str"] = f"CV {cv_val:.1f}%"
+                results["pass_cv"] = pass_cv
+    except Exception:
+        pass
 
-    # 9. 市場流動性檢驗 (近 20 日日均 >= 3000萬 或 >= 500張)
+    # 9. 市場流動性檢驗
     try:
         if len(df) >= 20:
             recent_20 = df.iloc[-20:]
-            daily_turnover = recent_20['Close'] * recent_20['Volume_Shares']
+            daily_turnover = recent_20['Close'] * recent_20['Volume']
             avg_turnover_m = (daily_turnover.mean()) / 10000000
-            avg_volume_lots = recent_20['Volume_Lots'].mean()
+            avg_volume_lots = (recent_20['Volume'].mean()) / 1000
 
             pass_liq = bool((avg_turnover_m >= 3.0) or (avg_volume_lots >= 500.0))
             results["liq_str"] = f"日均 {avg_turnover_m:.1f}千萬 ({int(avg_volume_lots)}張)"
@@ -338,19 +295,21 @@ def calculate_valuation_bands(curr_price, pe, target_mean):
 
 def generate_stock_report(code: str) -> str:
     code = code.strip().upper()
+    ticker = f"{code}.TW"
+    company_name = get_tw_stock_name(code)
     
-    # 1. 抓取 K 線（上市上櫃自動相容）
-    df, valid_symbol = fetch_cnyes_kline(code)
-    if df is None or len(df) < 30:
-        return f"⚠️ 查無代號【{code}】的歷史交易資料，請確認代碼是否正確。"
+    df = yf.download(ticker, period="2y", interval="1d", progress=False)
+    if df.empty or len(df) < 120:
+        ticker = f"{code}.TWO"
+        df = yf.download(ticker, period="2y", interval="1d", progress=False)
+        
+    if df.empty or len(df) < 120:
+        return f"⚠️ 查無代號【{code}】的完整歷史交易資料，請確認是否為 4 位數台股代碼。"
 
-    # 2. 抓取公司即時行情與財務比率
-    quote_info = fetch_cnyes_quote(valid_symbol, code)
-    fin_ratios = fetch_cnyes_financial_ratios(valid_symbol, code)
-    
-    company_name = quote_info.get("name") or quote_info.get("info", {}).get("name") or get_tw_stock_name(code)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
 
-    # 均線系統計算
+    # 均線系統
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     df['MA120'] = df['Close'].rolling(window=120).mean()
@@ -358,19 +317,18 @@ def generate_stock_report(code: str) -> str:
     
     close_today = float(df['Close'].iloc[-1])
     close_yesterday = float(df['Close'].iloc[-2])
-    ma20_today = float(df['MA20'].iloc[-1]) if not np.isnan(df['MA20'].iloc[-1]) else close_today
-    ma60_today = float(df['MA60'].iloc[-1]) if not np.isnan(df['MA60'].iloc[-1]) else close_today
-    ma60_yesterday = float(df['MA60'].iloc[-2]) if not np.isnan(df['MA60'].iloc[-2]) else close_yesterday
+    ma20_today = float(df['MA20'].iloc[-1])
+    ma60_today = float(df['MA60'].iloc[-1])
+    ma60_yesterday = float(df['MA60'].iloc[-2])
     ma120_today = float(df['MA120'].iloc[-1]) if not np.isnan(df['MA120'].iloc[-1]) else ma60_today
     ma240_today = float(df['MA240'].iloc[-1]) if not np.isnan(df['MA240'].iloc[-1]) else ma120_today
     
     bias_240 = ((close_today - ma240_today) / ma240_today) * 100
     
-    recent_high_60 = float(df['High'].iloc[-60:].max()) if len(df) >= 60 else float(df['High'].max())
-    recent_low_60 = float(df['Low'].iloc[-60:].min()) if len(df) >= 60 else float(df['Low'].min())
+    recent_high_60 = float(df['High'].iloc[-60:].max())
+    recent_low_60 = float(df['Low'].iloc[-60:].min())
     recent_low_20 = float(df['Low'].iloc[-20:].min())
 
-    # 雙日收盤價跌破季線確認機制
     today_below_ma60 = close_today < ma60_today
     yesterday_below_ma60 = close_yesterday < ma60_yesterday
     consecutive_2day_breakdown = today_below_ma60 and yesterday_below_ma60
@@ -385,8 +343,15 @@ def generate_stock_report(code: str) -> str:
     else:
         breakdown_status = "🟢 穩居 60MA 季線之上（短線多頭正常）"
 
-    # 九大體質評估
-    fund = evaluate_nine_fundamentals(quote_info, fin_ratios, df, close_today)
+    stock = yf.Ticker(ticker)
+    info = {}
+    try:
+        info = stock.info or {}
+    except Exception:
+        pass
+
+    # 將當前股價傳入，用於自主精算 PE
+    fund = evaluate_nine_fundamentals(stock, info, df, close_today)
     score = fund["pass_count"]
 
     # 法人目標價
@@ -394,19 +359,28 @@ def generate_stock_report(code: str) -> str:
     if target_info:
         target_mean = target_info["mean"]
         target_high = target_info["high"]
+        target_low = target_info["low"]
         analyst_count = target_info["count"]
         has_target = True
+        target_details = target_info["details"]
     else:
         has_target = False
         target_mean = None
+        target_details = []
 
     target_upside = ((target_mean - close_today) / close_today) * 100 if has_target else 0.0
 
     # 價格區間計算
     val_bands = calculate_valuation_bands(close_today, fund["pe"], target_mean)
 
+    # 技術關鍵價位
+    entry_tier1 = round(close_today, 2)
+    entry_tier2 = round(ma20_today, 2)
+    entry_tier3 = round(min(ma60_today, recent_low_20), 2)
     stop_loss_price = round(min(ma60_today * 0.97, recent_low_60 * 0.98), 2)
     stop_loss_pct = round(((stop_loss_price - close_today) / close_today) * 100, 2)
+    tp_tier1 = round(target_mean, 2) if has_target else round(val_bands["fair"] * 1.15, 2)
+    tp_tier2 = round(max(target_high if has_target else 0, val_bands["expensive"]), 2)
 
     # 操盤教練 A：短線 / 波段教練
     if not fund["pass_liq"]:
@@ -416,7 +390,7 @@ def generate_stock_report(code: str) -> str:
     elif consecutive_2day_breakdown:
         short_state = "短線趨勢轉弱（連續破季線）"
         short_signal = "⚫ 停損離場 / 減碼避開"
-        short_reason = "觸發雙日收盤跌破季線，短線動能熄火，依紀律減碼避開整理。"
+        short_reason = "觸發雙日收盤跌破季線，短線波段動能熄火，依紀律減碼避開整理。"
     elif single_day_breakdown:
         short_state = "季線測試（首日跌破）"
         short_signal = "🟠 警戒觀察 / 暫不動作"
@@ -442,7 +416,7 @@ def generate_stock_report(code: str) -> str:
     if score < 4 and fund["roe_str"] != "資料暫缺":
         long_state = "基本面護城河薄弱"
         long_signal = "🛑 剔除於長線核心池"
-        long_reason = f"九大核心體質僅通過 {score}/9 項，缺乏定價權與資本效率。"
+        long_reason = f"九大核心體質僅通過 {score}/9 項，缺乏足夠定價權與資本效率。"
     elif not fund["pass_cv"] and fund["cv_str"] != "資料暫缺":
         long_state = "強烈景氣週期波動"
         long_signal = "⚠️ 週期股陷阱 / 不宜重倉長抱"
@@ -450,19 +424,19 @@ def generate_stock_report(code: str) -> str:
     elif bias_240 > 45.0 or val_bands["zone_type"] == "EXPENSIVE":
         long_state = "長線估值極度狂熱"
         long_signal = "⚠️ 停止投入 / 逐步收割 20%"
-        long_reason = f"現價高於年線 {bias_240:.1f}%，暫停定期定額，可將部分利潤轉換為現金。"
+        long_reason = f"現價高於年線 {bias_240:.1f}%，停止定期定額，可將部分利潤轉換為現金儲備。"
     elif score >= 6 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and bias_240 <= 15.0:
         long_state = "長線黃金擊球區"
         long_signal = "💎 核心重倉 / 大額分批佈局"
-        long_reason = f"體質優異且處於合理偏低位階，貼近年線 ({ma240_today:.2f} 元)，屬長線低接良機。"
+        long_reason = f"體質優異且股價落入【便宜/合理偏低】，貼近年線 ({ma240_today:.2f} 元)，屬長線低接機會。"
     elif above_ma240:
         long_state = "長線多頭推升（年線走揚）"
         long_signal = "📈 定期定額扣款 / 堅定持有"
-        long_reason = f"穩居年線 ({ma240_today:.2f} 元) 之上，長線多頭架構完好，適合定期定額複利增長。"
+        long_reason = f"穩居年線 ({ma240_today:.2f} 元) 之上，長線多頭架構完好，透過定期定額享受資產複利增長。"
     else:
         long_state = "優質企業遭遇長線逆風"
         long_signal = "🧘 耐心定額攤平 / 勿恐慌殺低"
-        long_reason = f"股價在年線下方整理，若基本面未實質轉壞，切勿在低檔砍單，可耐心分批累積。"
+        long_reason = f"股價在年線下方整理，若基本面未轉壞，切勿在低檔砍單，可耐心逢低分批累積。"
 
     if has_target:
         analyst_section = f"• 涵蓋機構：{analyst_count} 家 | 平均目標：**{target_mean:.2f} 元** (空間: `{target_upside:+.1f}%`)\n"
@@ -500,7 +474,6 @@ def generate_stock_report(code: str) -> str:
     )
 
 # ================= Discord 機器人本體 =================
-
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -509,7 +482,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print("=" * 50)
-    print(f"🤖 全功能雙軌 Discord 機器人已在線！登入身分：{bot.user}")
+    print(f"🤖 Discord 機器人已成功在線！登入身分：{bot.user}")
     print("=" * 50)
 
 @bot.event
@@ -520,12 +493,12 @@ async def on_message(message):
     user_text = message.content.strip()
 
     if user_text.lower() == "ping":
-        await message.channel.send("🏓 Pong! 雙軌診斷機器人連線完全正常！請輸入 4 位數台股代碼（如 2330、6138）。")
+        await message.channel.send("🏓 Pong! 機器人連線完全正常！請輸入 4 位數股票代碼（如 2330）。")
         return
 
     if len(user_text) == 4 and user_text.isdigit():
         stock_name = get_tw_stock_name(user_text)
-        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行長短雙軌全方位診斷，請稍候約 1~2 秒...")
+        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行長短雙軌全方位診斷，請稍候約 3~5 秒...")
         try:
             report = await asyncio.to_thread(generate_stock_report, user_text)
             await wait_msg.edit(content=report)
@@ -535,13 +508,12 @@ async def on_message(message):
             
     await bot.process_commands(message)
 
-# ================= 輕量 Web 伺服器 (Render 保持在線) =================
-
+# ================= 輕量 Web 伺服器 =================
 class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is online and running 24/7!")
+        self.wfile.write(b"Discord Bot is online and running 24/7!")
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
