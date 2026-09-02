@@ -12,11 +12,6 @@ from discord.ext import commands
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-})
-
 def get_tw_stock_name(code: str) -> str:
     """取得台股標準繁體中文名稱"""
     if code in twstock.codes:
@@ -26,8 +21,11 @@ def get_tw_stock_name(code: str) -> str:
 def fetch_tw_analyst_targets(code: str):
     """從在地資料庫爬取台股內外資法人目標價"""
     url = f"https://ws.api.cnyes.com/ws/api/v1/quote/broker-target?symbol={code}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
     try:
-        res = requests.get(url, headers=session.headers, timeout=4).json()
+        res = requests.get(url, headers=headers, timeout=4).json()
         data = res.get("data", [])
         if not data:
             return None
@@ -57,28 +55,29 @@ def fetch_tw_analyst_targets(code: str):
         return None
 
 def evaluate_nine_fundamentals(stock, info, df):
-    """計算並檢驗九大長線核心基本面與流動性指標"""
-    fin = stock.financials
-    bs = stock.balance_sheet
-    cf = stock.cashflow
-    
+    """計算並檢驗九大長線核心基本面與流動性指標（具備 401 容錯降級保護）"""
     results = {
         "pass_count": 0,
-        "roe_str": "資料不足", "pass_roe": False,
-        "roic_str": "資料不足", "pass_roic": False,
-        "debt_str": "資料不足", "pass_debt": False,
-        "fcf_str": "資料不足", "pass_fcf": False,
-        "gm_str": "資料不足", "pass_gm": False,
-        "peg_str": "資料不足", "pass_peg": False,
-        "payout_str": "資料不足", "pass_payout": False,
-        "cv_str": "資料不足", "pass_cv": False,
-        "liq_str": "資料不足", "pass_liq": False,
+        "roe_str": "資料暫缺", "pass_roe": False,
+        "roic_str": "資料暫缺", "pass_roic": False,
+        "debt_str": "資料暫缺", "pass_debt": False,
+        "fcf_str": "資料暫缺", "pass_fcf": False,
+        "gm_str": "資料暫缺", "pass_gm": False,
+        "peg_str": "資料暫缺", "pass_peg": False,
+        "payout_str": "資料暫缺", "pass_payout": False,
+        "cv_str": "資料暫缺", "pass_cv": False,
+        "liq_str": "資料暫缺", "pass_liq": False,
         "pe": None
     }
     
-    if not (fin.empty or bs.empty or cf.empty or fin.shape[1] < 3):
-        try:
-            # 1. ROE (歷年平均 >= 15%, 低點 >= 8%)
+    # 1~8 項財務體質檢驗（全數置於防護網內，防止 401 崩潰）
+    try:
+        fin = stock.financials
+        bs = stock.balance_sheet
+        cf = stock.cashflow
+        
+        if not (fin.empty or bs.empty or cf.empty or fin.shape[1] < 3):
+            # 1. ROE
             net_incomes = fin.loc["Net Income Common Stockholders"] if "Net Income Common Stockholders" in fin.index else fin.loc["Net Income"]
             equity = bs.loc["Stockholders Equity"] if "Stockholders Equity" in bs.index else bs.loc["Total Equity Gross Minority Interest"]
             common_years = net_incomes.index.intersection(equity.index)
@@ -89,7 +88,7 @@ def evaluate_nine_fundamentals(stock, info, df):
             results["roe_str"] = f"均值 {avg_roe:.1f}% (低點 {min_roe:.1f}%)"
             results["pass_roe"] = pass_roe
 
-            # 2. ROIC (均值 >= 12%)
+            # 2. ROIC
             ebit = fin.loc["EBIT"] if "EBIT" in fin.index else (fin.loc["Operating Income"] if "Operating Income" in fin.index else net_incomes)
             nopat = ebit * 0.8
             total_debt = bs.loc["Total Debt"] if "Total Debt" in bs.index else (bs.loc["Total Liabilities Net Minority Interest"] * 0.5)
@@ -102,7 +101,7 @@ def evaluate_nine_fundamentals(stock, info, df):
             results["roic_str"] = f"均值 {avg_roic:.1f}%"
             results["pass_roic"] = pass_roic
 
-            # 3. 負債比率 (< 50%)
+            # 3. 負債比率
             total_liab = bs.loc["Total Liabilities Net Minority Interest"].iloc[0] if "Total Liabilities Net Minority Interest" in bs.index else 0
             total_assets = bs.loc["Total Assets"].iloc[0] if "Total Assets" in bs.index else 1
             debt_ratio = (total_liab / total_assets) * 100 if total_assets > 0 else 0
@@ -110,7 +109,7 @@ def evaluate_nine_fundamentals(stock, info, df):
             results["debt_str"] = f"{debt_ratio:.1f}%"
             results["pass_debt"] = pass_debt
 
-            # 4. FCF / 淨利 (>= 80%)
+            # 4. FCF / 淨利
             op_cash = cf.loc["Operating Cash Flow"] if "Operating Cash Flow" in cf.index else cf.loc["Cash Flow From Continuing Operating Activities"]
             capex = cf.loc["Capital Expenditure"].abs() if "Capital Expenditure" in cf.index else pd.Series(0, index=op_cash.index)
             fcf_series = op_cash - capex
@@ -132,7 +131,7 @@ def evaluate_nine_fundamentals(stock, info, df):
             results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
             results["pass_gm"] = pass_gm
 
-            # 6. PEG <= 1.2 或 PE <= 20
+            # 6. PEG 與 PE
             pe = info.get("trailingPE", None)
             results["pe"] = pe
             rev_start, rev_end = total_rev.iloc[-1], total_rev.iloc[0]
@@ -143,7 +142,7 @@ def evaluate_nine_fundamentals(stock, info, df):
             results["peg_str"] = f"PEG {peg:.2f}" if not np.isnan(peg) else (f"PE {pe:.1f}x" if pe else "N/A")
             results["pass_peg"] = pass_peg
 
-            # 7. 盈餘配發率 (35% - 65%)
+            # 7. 盈餘配發率
             payout_val = info.get("payoutRatio", None)
             payout_pct = payout_val * 100 if payout_val else None
             if payout_pct is not None:
@@ -161,10 +160,11 @@ def evaluate_nine_fundamentals(stock, info, df):
                 pass_cv = bool(cv_val < 25.0)
                 results["cv_str"] = f"CV {cv_val:.1f}%"
                 results["pass_cv"] = pass_cv
-        except Exception:
-            pass
+    except Exception:
+        # 當 Yahoo 財報接口拋出 401 時，優雅降級維持程式運作
+        pass
 
-    # 9. 市場流動性檢驗
+    # 9. 市場流動性檢驗（由本地 K 線計算，不依賴 Yahoo 授權）
     try:
         if len(df) >= 20:
             recent_20 = df.iloc[-20:]
@@ -247,11 +247,11 @@ def generate_stock_report(code: str) -> str:
     ticker = f"{code}.TW"
     company_name = get_tw_stock_name(code)
     
-    # 抓取近 2 年 K 線資料以計算 240MA 年線
-    df = yf.download(ticker, period="2y", interval="1d", progress=False, session=session)
+    # 抓取 K 線（yfinance download 走公開 API，不受 401 限制）
+    df = yf.download(ticker, period="2y", interval="1d", progress=False)
     if df.empty or len(df) < 120:
         ticker = f"{code}.TWO"
-        df = yf.download(ticker, period="2y", interval="1d", progress=False, session=session)
+        df = yf.download(ticker, period="2y", interval="1d", progress=False)
         
     if df.empty or len(df) < 120:
         return f"⚠️ 查無代號【{code}】的完整歷史交易資料，請確認是否為 4 位數台股代碼。"
@@ -259,7 +259,7 @@ def generate_stock_report(code: str) -> str:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 短、中、長均線系統
+    # 均線系統
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     df['MA120'] = df['Close'].rolling(window=120).mean()
@@ -273,14 +273,13 @@ def generate_stock_report(code: str) -> str:
     ma120_today = float(df['MA120'].iloc[-1]) if not np.isnan(df['MA120'].iloc[-1]) else ma60_today
     ma240_today = float(df['MA240'].iloc[-1]) if not np.isnan(df['MA240'].iloc[-1]) else ma120_today
     
-    # 年線乖離率
     bias_240 = ((close_today - ma240_today) / ma240_today) * 100
     
     recent_high_60 = float(df['High'].iloc[-60:].max())
     recent_low_60 = float(df['Low'].iloc[-60:].min())
     recent_low_20 = float(df['Low'].iloc[-20:].min())
 
-    # 短線季線雙日確認
+    # 短線雙日跌破確認
     today_below_ma60 = close_today < ma60_today
     yesterday_below_ma60 = close_yesterday < ma60_yesterday
     consecutive_2day_breakdown = today_below_ma60 and yesterday_below_ma60
@@ -295,9 +294,14 @@ def generate_stock_report(code: str) -> str:
     else:
         breakdown_status = "🟢 穩居 60MA 季線之上（短線多頭正常）"
 
-    # 九大體質檢驗
-    stock = yf.Ticker(ticker, session=session)
-    info = stock.info if hasattr(stock, "info") else {}
+    # 安全讀取 Ticker 基本資料（防 401 崩潰隔離罩）
+    stock = yf.Ticker(ticker)
+    info = {}
+    try:
+        info = stock.info or {}
+    except Exception:
+        pass
+
     fund = evaluate_nine_fundamentals(stock, info, df)
     score = fund["pass_count"]
 
@@ -329,7 +333,7 @@ def generate_stock_report(code: str) -> str:
     tp_tier1 = round(target_mean, 2) if has_target else round(val_bands["fair"] * 1.15, 2)
     tp_tier2 = round(max(target_high if has_target else 0, val_bands["expensive"]), 2)
 
-    # ================= 操盤教練 A：短線 / 波段教練（1~6個月視角） =================
+    # 操盤教練 A：短線 / 波段教練
     if not fund["pass_liq"]:
         short_state = "短線流動性受限"
         short_signal = "⚠️ 慎防滑價 / 不宜大額進出"
@@ -359,43 +363,37 @@ def generate_stock_report(code: str) -> str:
         short_signal = "🟠 觀望等待"
         short_reason = "未達波段進場標準，建議保留現金等待訊號明朗。"
 
-    # ================= 操盤教練 B：長線價值 / 趨勢教練（3~10年視角） =================
-    if score < 5:
+    # 操盤教練 B：長線價值 / 趨勢教練
+    if score < 4 and fund["roe_str"] != "資料暫缺":
         long_state = "基本面護城河薄弱"
         long_signal = "🛑 剔除於長線核心池"
-        long_reason = f"九大核心體質僅通過 {score}/9 項，缺乏足夠定價權與資本效率，不符合長線複利標準。"
-    elif not fund["pass_cv"]:
+        long_reason = f"九大核心體質僅通過 {score}/9 項，缺乏足夠定價權與資本效率。"
+    elif not fund["pass_cv"] and fund["cv_str"] != "資料暫缺":
         long_state = "強烈景氣週期波動"
         long_signal = "⚠️ 週期股陷阱 / 不宜重倉長抱"
-        long_reason = f"毛利率變異係數 ({fund['cv_str']}) 偏高，獲利隨景氣暴起暴落，不適合作為 3 年以上存股重倉標的。"
+        long_reason = f"毛利率變異係數 ({fund['cv_str']}) 偏高，獲利隨景氣暴起暴落。"
     elif bias_240 > 45.0 or val_bands["zone_type"] == "EXPENSIVE":
-        long_state = "長線估值極度狂熱（遠離年線）"
+        long_state = "長線估值極度狂熱"
         long_signal = "⚠️ 停止投入 / 逐步收割 20%"
-        long_reason = f"現價高於年線 {bias_240:.1f}%，市場情緒過度樂觀，停止定期定額，可將 20%~30% 利潤落袋轉換為現金儲備。"
-    elif score >= 7 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and bias_240 <= 15.0:
-        long_state = "長線黃金擊球區（護城河卓越 ＋ 估值具安全邊際）"
+        long_reason = f"現價高於年線 {bias_240:.1f}%，停止定期定額，可將部分利潤轉換為現金儲備。"
+    elif score >= 6 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and bias_240 <= 15.0:
+        long_state = "長線黃金擊球區"
         long_signal = "💎 核心重倉 / 大額分批佈局"
-        long_reason = f"體質通過 {score}/9 項，股價落入【便宜/合理偏低】且貼近年線 ({ma240_today:.2f} 元)，屬長線難得的恐慌特價機會，建議堅定分批累積。"
-    elif score >= 6 and above_ma240:
+        long_reason = f"體質優異且股價落入【便宜/合理偏低】，貼近年線 ({ma240_today:.2f} 元)，屬長線低接機會。"
+    elif above_ma240:
         long_state = "長線多頭推升（年線走揚）"
         long_signal = "📈 定期定額扣款 / 堅定持有"
-        long_reason = f"穩居年線 ({ma240_today:.2f} 元) 之上，年線斜率向上。長線投資人應完全忽視短線日/週波動，透過定期定額享受資產複利增長。"
-    elif score >= 6 and not above_ma240:
-        long_state = "優質企業遭遇長線逆風（年線下方築底）"
-        long_signal = "🧘 耐心定額攤平 / 不恐慌殺低"
-        long_reason = f"體質依然優秀 ({score}/9)，跌破年線往往是大盤系統性殺盤所致。只要護城河未受損，切勿在低檔砍單，可啟動災難儲備金小額加碼。"
+        long_reason = f"穩居年線 ({ma240_today:.2f} 元) 之上，長線多頭架構完好，透過定期定額享受資產複利增長。"
     else:
-        long_state = "長線結構待驗證"
-        long_signal = "🟠 觀察清單 / 暫緩大額資金"
-        long_reason = "長期趨勢與基本面共振尚不明顯，列入觀察池靜待更佳買點。"
+        long_state = "優質企業遭遇長線逆風"
+        long_signal = "🧘 耐心定額攤平 / 勿恐慌殺低"
+        long_reason = f"股價在年線下方整理，若基本面未轉壞，切勿在低檔砍單，可耐心逢低分批累積。"
 
-    # 格式化目標價
     if has_target:
         analyst_section = f"• 涵蓋機構：{analyst_count} 家 | 平均目標：**{target_mean:.2f} 元** (空間: `{target_upside:+.1f}%`)\n"
     else:
         analyst_section = "• 暫無近半年公開目標價（中小型股或未被大型投顧覆蓋）。\n"
 
-    # Discord 格式輸出（精簡版面避免超過 2000 字元限制）
     return (
         f"📊 **【 {company_name} ({code}) 長短雙軌深度診斷】**\n"
         f"────────────────────────\n"
