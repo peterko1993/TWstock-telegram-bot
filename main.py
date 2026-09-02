@@ -55,7 +55,7 @@ def fetch_tw_analyst_targets(code: str):
         return None
 
 def evaluate_nine_fundamentals(stock, info, df, close_today):
-    """計算並檢驗九大長線核心基本面（實裝 100% 自主精算 PEG 引擎）"""
+    """計算並檢驗九大長線核心基本面（PEG 項目同時並列精確 PE 數據）"""
     results = {
         "pass_count": 0,
         "roe_str": "資料暫缺", "pass_roe": False,
@@ -131,8 +131,8 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
             results["gm_str"] = f"最新 {latest_gm:.1f}% (均值 {avg_gm:.1f}%)"
             results["pass_gm"] = pass_gm
 
-            # ================= 6. 100% 自主精算 PEG (彼得·林區模型) =================
-            # (1) 取得最新 EPS
+            # ================= 6. 自主精算 PE 與 PEG 並行引擎 =================
+            # (1) 精算最新 EPS
             for eps_key in ["Diluted EPS", "Basic EPS", "Diluted Normalized EPS"]:
                 if eps_key in fin.index:
                     val = fin.loc[eps_key].iloc[0]
@@ -159,8 +159,9 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
 
             pe = round(close_today / eps, 2) if (eps and eps > 0) else None
             results["pe"] = pe
+            pe_display = f"PE {pe:.1f}x" if pe else "PE N/A"
 
-            # (2) 計算年化複合成長率 G (CAGR)
+            # (2) 計算複合成長率 G (CAGR)
             n_years = len(fin.columns) - 1
             if n_years > 0:
                 ni_latest = float(net_incomes.iloc[0])
@@ -171,12 +172,10 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
                 rev_oldest = float(total_rev.iloc[-1])
                 g_rev = (((rev_latest / rev_oldest) ** (1 / n_years)) - 1) * 100 if (rev_latest > 0 and rev_oldest > 0) else None
 
-                # 決定綜合成長率 G
                 if g_ni is not None and 0 < g_ni <= 80:
                     growth_rate = g_ni
                     g_label = "淨利"
                 elif g_ni is not None and g_ni > 80 and g_rev and g_rev > 0:
-                    # 避免低基期導致成長率失真，取淨利與營收平均
                     growth_rate = (g_ni + g_rev) / 2
                     g_label = "綜合"
                 elif g_rev is not None and g_rev > 0:
@@ -192,17 +191,17 @@ def evaluate_nine_fundamentals(stock, info, df, close_today):
                 growth_rate = 0.0
                 g_label = "無"
 
-            # (3) 判定 PEG <= 1.2
+            # (3) 同時並列 PE 與 PEG 數據輸出
             if pe and pe > 0 and growth_rate > 0:
                 peg = round(pe / growth_rate, 2)
                 pass_peg = bool(peg <= 1.2)
-                results["peg_str"] = f"PEG {peg:.2f} ({g_label}G:{growth_rate:.1f}%, PE:{pe:.1f}x)"
+                results["peg_str"] = f"{pe_display} | PEG {peg:.2f} ({g_label}G:{growth_rate:.1f}%)"
                 results["pass_peg"] = pass_peg
             elif pe and pe > 0 and growth_rate <= 0:
-                results["peg_str"] = f"衰退無效 ({g_label}G:{growth_rate:.1f}%, PE:{pe:.1f}x)"
+                results["peg_str"] = f"{pe_display} | PEG 衰退無效 ({g_label}G:{growth_rate:.1f}%)"
                 results["pass_peg"] = False
             else:
-                results["peg_str"] = "獲利虧損/無法計算"
+                results["peg_str"] = f"{pe_display} | PEG 無法計算"
                 results["pass_peg"] = False
 
             # 7. 盈餘配發率
@@ -373,7 +372,7 @@ def generate_stock_report(code: str) -> str:
     except Exception:
         pass
 
-    # 自主計算基本面（含專屬 PEG 引擎）
+    # 自主計算基本面
     fund = evaluate_nine_fundamentals(stock, info, df, close_today)
     score = fund["pass_count"]
 
@@ -393,7 +392,7 @@ def generate_stock_report(code: str) -> str:
 
     target_upside = ((target_mean - close_today) / close_today) * 100 if has_target else 0.0
 
-    # 價格區間計算（使用自主精算出的 PE，精準度提升）
+    # 價格區間計算
     val_bands = calculate_valuation_bands(close_today, fund["pe"], target_mean)
 
     # 技術關鍵價位
@@ -473,7 +472,7 @@ def generate_stock_report(code: str) -> str:
         f"🏛️ **一、長線九大核心體質 ({score}/9 通過)**\n"
         f"• ROE: {fund['roe_str']} ({'✅' if fund['pass_roe'] else '❌'}) | ROIC: {fund['roic_str']} ({'✅' if fund['pass_roic'] else '❌'})\n"
         f"• 負債比: {fund['debt_str']} ({'✅' if fund['pass_debt'] else '❌'}) | 現金流率: {fund['fcf_str']} ({'✅' if fund['pass_fcf'] else '⚠️'})\n"
-        f"• 毛利率: {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'}) | PEG估值: {fund['peg_str']} ({'✅' if fund['pass_peg'] else '❌'})\n"
+        f"• 毛利率: {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'}) | 估值: {fund['peg_str']} ({'✅' if fund['pass_peg'] else '❌'})\n"
         f"• 配發率: {fund['payout_str']} ({'✅' if fund['pass_payout'] else '⚠️'}) | CV防週期: {fund['cv_str']} ({'✅' if fund['pass_cv'] else '❌'})\n"
         f"• 市場流動性: {fund['liq_str']} ({'✅' if fund['pass_liq'] else '⚠️'})\n\n"
         f"🏷️ **二、長線合理價格區間與目標價**\n"
