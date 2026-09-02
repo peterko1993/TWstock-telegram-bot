@@ -164,14 +164,13 @@ def evaluate_nine_fundamentals(stock, info, df):
         except Exception:
             pass
 
-    # 9. 市場流動性檢驗
+    # 9. 市場流動性
     try:
         if len(df) >= 20:
             recent_20 = df.iloc[-20:]
             daily_turnover = recent_20['Close'] * recent_20['Volume']
             avg_turnover_m = (daily_turnover.mean()) / 10000000
             avg_volume_lots = (recent_20['Volume'].mean()) / 1000
-
             pass_liq = bool((avg_turnover_m >= 3.0) or (avg_volume_lots >= 500.0))
             results["liq_str"] = f"日均 {avg_turnover_m:.1f}千萬 ({int(avg_volume_lots)}張)"
             results["pass_liq"] = pass_liq
@@ -247,7 +246,7 @@ def generate_stock_report(code: str) -> str:
     ticker = f"{code}.TW"
     company_name = get_tw_stock_name(code)
     
-    # 調取近 2 年數據以計算日 K 與週 K 線
+    # 抓取 2 年日資料，供日線與週線共同計算
     df = yf.download(ticker, period="2y", interval="1d", progress=False, session=session)
     if df.empty or len(df) < 65:
         ticker = f"{code}.TWO"
@@ -259,7 +258,7 @@ def generate_stock_report(code: str) -> str:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    # 1. 短線技術面（日線 MA20、MA60）
+    # 1. 短中線指標（日 K 線）
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
@@ -273,31 +272,32 @@ def generate_stock_report(code: str) -> str:
     recent_low_60 = float(df['Low'].iloc[-60:].min())
     recent_low_20 = float(df['Low'].iloc[-20:].min())
 
-    # 短線雙日跌破確認
     today_below_ma60 = close_today < ma60_today
     yesterday_below_ma60 = close_yesterday < ma60_yesterday
     consecutive_2day_breakdown = today_below_ma60 and yesterday_below_ma60
     single_day_breakdown = today_below_ma60 and not yesterday_below_ma60
+    above_ma60 = close_today >= ma60_today
 
     if consecutive_2day_breakdown:
-        breakdown_status = "🔴 連續 2 日跌破日季線（短線觸發嚴格停損）"
+        breakdown_status = "🔴 連續 2 日收盤跌破季線（短線實體破線確認）"
     elif single_day_breakdown:
-        breakdown_status = "🟡 首日跌破日季線（短線警戒，待次日收盤確認）"
+        breakdown_status = "🟡 首日收盤跌破季線（短線警戒觀察，待次日收盤確認）"
     else:
-        breakdown_status = "🟢 穩居日季線之上（短線多頭架構完好）"
+        breakdown_status = "🟢 穩居日 60MA 季線之上（短中線多頭格局完好）"
 
-    # 2. 長線技術面（週線級別：W_MA20 半年線、W_MA60 兩年景氣線）
+    # 2. 長線宏觀指標（週 K 線：半年線 W20MA 與兩年景氣線 W60MA）
     df_weekly = df['Close'].resample('W-FRI').last().dropna()
     w_ma20 = float(df_weekly.rolling(20).mean().iloc[-1]) if len(df_weekly) >= 20 else ma20_today
     w_ma60 = float(df_weekly.rolling(60).mean().iloc[-1]) if len(df_weekly) >= 60 else ma60_today
-    above_w_ma60 = close_today >= w_ma60
-
-    if above_w_ma60:
-        macro_trend = "🟢 站穩兩年景氣生命線（大景氣多頭擴張期）"
+    
+    if close_today >= w_ma20:
+        weekly_macro_trend = f"🟢 站穩週 20MA 半年線 ({w_ma20:.1f}元) - 長線多頭主升段"
+    elif close_today >= w_ma60:
+        weekly_macro_trend = f"🟡 回測週 60MA 兩年線 ({w_ma60:.1f}元) - 長線中期良性整理"
     else:
-        macro_trend = "🟠 處於兩年景氣生命線之下（大景氣深度修正或築底期）"
+        weekly_macro_trend = f"🟠 跌破週 60MA 兩年線 ({w_ma60:.1f}元) - 產業面臨深度週期循環底"
 
-    # 3. 九大體質檢驗
+    # 3. 基本面與估值
     stock = yf.Ticker(ticker, session=session)
     info = stock.info if hasattr(stock, "info") else {}
     fund = evaluate_nine_fundamentals(stock, info, df)
@@ -318,11 +318,9 @@ def generate_stock_report(code: str) -> str:
         target_details = []
 
     target_upside = ((target_mean - close_today) / close_today) * 100 if has_target else 0.0
-
-    # 5. 價格區間計算
     val_bands = calculate_valuation_bands(close_today, fund["pe"], target_mean)
 
-    # 短線關鍵價位
+    # 5. 短中線關鍵價位
     entry_tier1 = round(close_today, 2)
     entry_tier2 = round(ma20_today, 2)
     entry_tier3 = round(min(ma60_today, recent_low_20), 2)
@@ -331,46 +329,68 @@ def generate_stock_report(code: str) -> str:
     tp_tier1 = round(target_mean, 2) if has_target else round(val_bands["fair"] * 1.15, 2)
     tp_tier2 = round(max(target_high if has_target else 0, val_bands["expensive"]), 2)
 
-    # 6. 長線護城河檢驗與大週期視角邏輯
-    if score >= 7 and fund["pass_cv"]:
-        moat_health = "🛡️ 護城河極度穩固（核心競爭力未變質）"
-        if consecutive_2day_breakdown:
-            long_term_verdict = "【長線特價黃金坑】短線跌破日線引發恐慌，但長線護城河完好且具備定價權。長線投資者切勿恐慌殺低，若估值落入便宜區，屬 3~5 年不可多得的逢低分批布局良機。"
-        else:
-            long_term_verdict = "【長線優質資產】企業具備持續複利能力，大趨勢維持健康，建議長期持有並享受複利成長。"
-    elif not fund["pass_cv"]:
-        moat_health = "⚠️ 護城河受報價週期侵蝕（非結構性定價權）"
-        long_term_verdict = "【長線週期陷阱警戒】毛利率波動過劇烈，該公司獲利屬於景氣週期紅利而非護城河。長線投資者不宜作為核心長抱配置，謹防獲利反轉腰斬。"
-    elif score < 6:
-        moat_health = "❌ 護城河有鬆動隱憂（多項基本面未達標）"
-        long_term_verdict = "【長線護城河質變】企業獲利能力或現金流轉弱，短線破線伴隨基本面轉差，長線投資者亦應同步檢視減碼，不宜盲目越跌越買。"
-    else:
-        moat_health = "🟡 護城河尚屬穩健（維持常態運作）"
-        long_term_verdict = "【長線穩健觀察】基本面維持標準之上，依定期定額或逢低拉回合理價再行承接。"
-
-    # 7. 操盤教練雙軌決策指令
-    # 短線指令
-    if consecutive_2day_breakdown:
-        st_signal = "⚫ 停損換股 / 嚴格避開（連續兩日收盤跌破季線）"
+    # 6. 【短中線操盤教練決策】（波段維度）
+    if not fund["pass_liq"]:
+        status_state = "流動性不足預警（日均交投偏低）"
+        coach_signal = "⚠️ 慎防流動性滑價 / 不宜大額建倉"
+        action_plan = f"近 20 日市場交投較冷清 ({fund['liq_str']})，遇急跌恐面臨滑價風險。若配置，部位切勿超過總資金 5%。"
+    elif consecutive_2day_breakdown:
+        status_state = "短線破線轉弱（連續兩日收盤跌破季線）"
+        coach_signal = "⚫ 短線停損離場 / 減碼避開"
+        action_plan = "波段策略觸發雙日收盤破季線硬性風控，消除假跌破疑慮，短線交易者應執行停損以防範持續修正。"
     elif single_day_breakdown:
-        st_signal = "🟠 警戒觀察 / 暫不動作（首日跌破，待次日收盤確認）"
-    elif val_bands["zone_type"] == "EXPENSIVE":
-        st_signal = "🔴 分批獲利了結（估值進入昂貴過熱區）"
-    elif close_today >= ma60_today and score >= 6:
-        st_signal = "🟢 強力買進 / 梯隊建倉（短線站穩季線，多頭排列）"
+        status_state = "測試短線季線（首日跌破，假跌破洗盤觀察中）"
+        coach_signal = "🟠 警戒觀察 / 暫不動作"
+        action_plan = "今日為首度收盤跌破季線，主力常利用單日摜破誘空。請勿恐慌殺低，待次日收盤確認。"
+    elif not fund["pass_cv"]:
+        status_state = "毛利波動劇烈（高度疑似景氣循環陷阱）"
+        coach_signal = "🟠 提高警覺 / 不宜重倉"
+        action_plan = f"毛利率變異係數 ({fund['cv_str']}) 超標，獲利隨週期起伏，波段操作切忌追高。"
+    elif val_bands["zone_type"] == "EXPENSIVE" or (has_target and target_upside < -5.0):
+        status_state = "短線估值過熱（超越目標價/高於昂貴價）"
+        coach_signal = "🔴 分批獲利了結"
+        action_plan = f"現價高於昂貴價 ({val_bands['expensive']} 元)，短線利潤空間壓縮，建議在第一/第二目標位逐步減碼 1/3~1/2。"
+    elif score >= 7 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and above_ma60:
+        status_state = "波段黃金共振（體質頂級 ＋ 估值便宜 ＋ 站穩日季線）"
+        coach_signal = "🟢 強力買進 / 積極分批"
+        action_plan = f"九大指標拿下 {score}/9 高分，落入便宜區間。按 30%(現價) / 40%(回測月線) / 30%(突破季線) 梯隊分批建立部位。"
+    elif score >= 6 and above_ma60:
+        status_state = "多頭穩健推進（基本面良好 ＋ 趨勢健康）"
+        coach_signal = "🟡 逢低承接 / 續抱觀察"
+        action_plan = f"體質評分良好 ({score}/9) 且季線支撐明確。原有部位續抱；欲加碼等待拉回月線 ({ma20_today:.2f} 元) 止跌紅 K 再介入。"
     else:
-        st_signal = "🟡 逢低承接 / 續抱觀察"
+        status_state = "盤整待變 / 競爭優勢不明顯"
+        coach_signal = "🟠 觀望等待"
+        action_plan = "多空條件未達共振標準，未見顯著安全邊際，建議保留現金耐心等待。"
 
-    # 長線指令
-    if not fund["pass_cv"] or score < 5:
-        lt_signal = "⚫ 不宜作為長線核心重倉（週期性過高或護城河不足）"
-    elif val_bands["zone_type"] == "CHEAP" and score >= 7:
-        lt_signal = "💎 極品長線布局區（頂級護城河 ＋ 估值具顯著安全邊際）"
-    elif val_bands["zone_type"] == "EXPENSIVE":
-        lt_signal = "🔴 逐步收回本金利潤（長線估值透支，調節 20% 轉入災難儲備金）"
+    # 7. 【長線 3～10 年護城河檢驗與持有提醒】（複利維度）
+    if score >= 7 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"]:
+        long_term_strategy = (
+            "💎 **【特價格局，長線複利黃金窗口】**\n"
+            f"• 護城河評估：拿下 {score}/9 高分，毛利 CV 與現金流極度穩固，非假性景氣股。\n"
+            f"• 長線建倉節奏：短線破線或回測兩年線 ({w_ma60:.1f} 元) 皆為特價機會，建議以「季度財報」為單位，每季分批吸納，切忌被短線震盪震出場。\n"
+            "• 唯一長線停損條件：僅在「毛利率連續 2 季跌破低標」或「自由現金流轉負」等競爭優勢崩塌時才認賠出清。"
+        )
+    elif score >= 7 and val_bands["zone_type"] == "EXPENSIVE":
+        long_term_strategy = (
+            "🏆 **【優質資產但估值偏高，只抱不追】**\n"
+            "• 護城河評估：企業基本面無可挑剔，但現價已反映未來樂觀預期。\n"
+            "• 長線處置：現有持股續抱享受複利，暫停投入新資金。靜待市場系統性恐慌回踩週 20MA 或合理價時再重啟加碼。"
+        )
+    elif not fund["pass_cv"] or score < 5:
+        long_term_strategy = (
+            "⚠️ **【護城河不足 / 週期波動大，不符長線標準】**\n"
+            "• 護城河評估：毛利率波動大或自由現金流不足，欠缺可預測之定價權。\n"
+            "• 長線處置：此標的僅適合作為波段操作，嚴格禁止作為 3~10 年資產傳承與複利核心重倉，避免高檔套牢漫長等待。"
+        )
     else:
-        lt_signal = "🟢 耐心長抱 / 定期定額分批累積股數"
+        long_term_strategy = (
+            "⏳ **【體質尚可，列入長期觀察池】**\n"
+            "• 護城河評估：各項指標中規中矩，暫無致命缺陷但缺少定價優勢。\n"
+            "• 長線處置：長線配置建議先以 0050 或頂級權值龍頭為優先，待其連續 3 季 ROIC 與 FCF 顯著上揚後再升級為核心持股。"
+        )
 
+    # 法人區塊
     if has_target:
         analyst_section = f"• 涵蓋機構：{analyst_count} 家法人報告\n• 平均目標：**{target_mean:.2f} 元** (空間: `{target_upside:+.1f}%`)\n• 目標區間：{target_low:.2f} ~ {target_high:.2f} 元\n"
         if target_details:
@@ -380,9 +400,11 @@ def generate_stock_report(code: str) -> str:
 
     # Discord 格式輸出
     return (
-        f"📊 **【 {company_name} ({code}) 深度診斷報告】**\n"
+        f"📊 **【 {company_name} ({code}) 長線全方位深度診斷】**\n"
         f"────────────────────────\n"
-        f"📌 現價：`{close_today:.2f} 元` | 月線(20MA)：`{ma20_today:.2f}` | 季線(60MA)：`{ma60_today:.2f}`\n\n"
+        f"📌 **即時與均線位階**\n"
+        f"• 現價：`{close_today:.2f} 元` | 日月線：`{ma20_today:.2f}` | 日季線：`{ma60_today:.2f}`\n"
+        f"• 週線宏觀：{weekly_macro_trend}\n\n"
         f"🏛️ **一、長線九大核心體質檢驗 ({score}/9 通過)**\n"
         f"1. ROE (均≧15%,低≧8%): {fund['roe_str']} ({'✅' if fund['pass_roe'] else '❌'})\n"
         f"2. ROIC (均≧12%): {fund['roic_str']} ({'✅' if fund['pass_roic'] else '❌'})\n"
@@ -397,23 +419,21 @@ def generate_stock_report(code: str) -> str:
         f"• 便宜價（安全邊際）：`{val_bands['cheap']} 元`\n"
         f"• 合理價（公允價值）：`{val_bands['fair']} 元`\n"
         f"• 昂貴價（估值過熱）：`{val_bands['expensive']} 元`\n"
-        f"• **當前位階**：{val_bands['zone_status']}\n\n"
+        f"• 當前位階：{val_bands['zone_status']}\n\n"
         f"🎯 **三、法人目標價與評等共識**\n"
         f"{analyst_section}\n"
-        f"⚡ **四、短線波段操作關鍵價位（日線級別）**\n"
-        f"• 分批梯隊：第一批(現價) `{entry_tier1}` | 第二批(月線) `{entry_tier2}` | 第三批(季線) `{entry_tier3}`\n"
-        f"• 雙日確認狀態：{breakdown_status}\n"
-        f"• 短線防守停損價：`{stop_loss_price} 元` (`{stop_loss_pct}%`)\n"
-        f"• 短線獲利目標：第一目標 `{tp_tier1} 元` | 第二目標 `{tp_tier2} 元`\n\n"
-        f"🛡️ **五、長線護城河檢驗與大趨勢（週線/3~10年級別）**\n"
-        f"• 週 20MA (半年線)：`{w_ma20:.2f} 元` | 週 60MA (兩年景氣線)：`{w_ma60:.2f} 元`\n"
-        f"• 長線景氣大趨勢：{macro_trend}\n"
-        f"• 護城河健康度：{moat_health}\n"
-        f"• **長線質變檢驗評估**：\n> {long_term_verdict}\n\n"
+        f"💡 **四、短中線技術關鍵價位與風控防守**\n"
+        f"【短線分批梯隊】現價 `{entry_tier1}` | 月線 `{entry_tier2}` | 季線防守 `{entry_tier3}`\n"
+        f"【雙日跌破狀態】{breakdown_status}\n"
+        f"【波段關鍵停損】`{stop_loss_price} 元` (`{stop_loss_pct}%`)\n"
+        f"【波段目標停利】第一目標 `{tp_tier1} 元` | 第二目標 `{tp_tier2} 元`\n\n"
         f"────────────────────────\n"
-        f"🧭 **六、【操盤教練雙軌決策指南】**\n"
-        f"• ⚡ **短線波段方針**：{st_signal}\n"
-        f"• 🛡️ **長線複利方針**：{lt_signal}\n"
+        f"🧭 **五、【短中線操盤教練決策（波段視角）】**\n"
+        f"• 標的狀態：**{status_state}**\n"
+        f"• 操作指令：**{coach_signal}**\n"
+        f"• 決策理由：{action_plan}\n\n"
+        f"🛡️ **六、【長線 3～10 年護城河檢驗與持有提醒（複利視角）】**\n"
+        f"{long_term_strategy}\n"
         f"────────────────────────"
     )
 
@@ -442,7 +462,7 @@ async def on_message(message):
 
     if len(user_text) == 4 and user_text.isdigit():
         stock_name = get_tw_stock_name(user_text)
-        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行短長線雙軌體質與價位精算，請稍候約 3~5 秒...")
+        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行雙週期分析（短線波段 ＋ 長線護城河檢驗），請稍候約 3~5 秒...")
         try:
             report = await asyncio.to_thread(generate_stock_report, user_text)
             await wait_msg.edit(content=report)
