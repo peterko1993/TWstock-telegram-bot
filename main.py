@@ -10,7 +10,7 @@ import twstock
 import discord
 from discord.ext import commands
 
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
 
 session = requests.Session()
 session.headers.update({
@@ -18,7 +18,7 @@ session.headers.update({
 })
 
 def get_tw_stock_name(code: str) -> str:
-    """自動取得台股標準繁體中文名稱"""
+    """取得台股標準繁體中文名稱"""
     if code in twstock.codes:
         return twstock.codes[code].name
     return code
@@ -70,7 +70,8 @@ def evaluate_seven_fundamentals(stock, info):
         "fcf_str": "資料不足", "pass_fcf": False,
         "gm_str": "資料不足", "pass_gm": False,
         "peg_str": "資料不足", "pass_peg": False,
-        "payout_str": "資料不足", "pass_payout": False
+        "payout_str": "資料不足", "pass_payout": False,
+        "pe": None
     }
     
     if fin.empty or bs.empty or cf.empty or fin.shape[1] < 3:
@@ -133,6 +134,7 @@ def evaluate_seven_fundamentals(stock, info):
 
         # 6. PEG <= 1.2 或 PE <= 20
         pe = info.get("trailingPE", None)
+        results["pe"] = pe
         rev_start, rev_end = total_rev.iloc[-1], total_rev.iloc[0]
         n_years = len(total_rev) - 1
         rev_cagr = (((rev_end / rev_start) ** (1 / n_years)) - 1) * 100 if (rev_start > 0 and n_years > 0) else 0
@@ -159,6 +161,66 @@ def evaluate_seven_fundamentals(stock, info):
 
     return results
 
+def calculate_valuation_bands(curr_price, pe, target_mean):
+    """計算便宜價、合理價、昂貴價及當前所處位階"""
+    eps = (curr_price / pe) if (pe and pe > 0) else None
+
+    # 模型 A：本益比歷史位階
+    if eps and eps > 0:
+        cheap_pe = eps * 14.0
+        fair_pe = eps * 18.0
+        expensive_pe = eps * 24.0
+    else:
+        cheap_pe, fair_pe, expensive_pe = None, None, None
+
+    # 模型 B：法人目標價折價（安全邊際）
+    if target_mean and target_mean > 0:
+        cheap_target = target_mean * 0.78
+        fair_target = target_mean * 0.88
+        expensive_target = target_mean * 1.05
+    else:
+        cheap_target, fair_target, expensive_target = None, None, None
+
+    # 綜合加權估值
+    if cheap_target and cheap_pe:
+        cheap_val = round(cheap_target * 0.6 + cheap_pe * 0.4, 2)
+        fair_val = round(fair_target * 0.6 + fair_pe * 0.4, 2)
+        expensive_val = round(expensive_target * 0.6 + expensive_pe * 0.4, 2)
+    elif cheap_target:
+        cheap_val = round(cheap_target, 2)
+        fair_val = round(fair_target, 2)
+        expensive_val = round(expensive_target, 2)
+    elif cheap_pe:
+        cheap_val = round(cheap_pe, 2)
+        fair_val = round(fair_pe, 2)
+        expensive_val = round(expensive_pe, 2)
+    else:
+        cheap_val = round(curr_price * 0.80, 2)
+        fair_val = round(curr_price * 0.95, 2)
+        expensive_val = round(curr_price * 1.20, 2)
+
+    # 判定當前位階
+    if curr_price <= cheap_val:
+        zone_status = "🟢 便宜價區間（安全邊際充足，適合積極分批）"
+        zone_type = "CHEAP"
+    elif cheap_val < curr_price <= fair_val:
+        zone_status = "🟡 合理偏低區間（估值健康，可穩健建倉）"
+        zone_type = "FAIR_LOW"
+    elif fair_val < curr_price <= expensive_val:
+        zone_status = "⚪ 合理偏高區間（成長預期充分反映，續抱不追高）"
+        zone_type = "FAIR_HIGH"
+    else:
+        zone_status = "🔴 昂貴價區間（估值過熱，防範技術修正風險）"
+        zone_type = "EXPENSIVE"
+
+    return {
+        "cheap": cheap_val,
+        "fair": fair_val,
+        "expensive": expensive_val,
+        "zone_status": zone_status,
+        "zone_type": zone_type
+    }
+
 def generate_stock_report(code: str) -> str:
     code = code.strip().upper()
     ticker = f"{code}.TW"
@@ -175,6 +237,7 @@ def generate_stock_report(code: str) -> str:
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
+    # 技術面
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA60'] = df['Close'].rolling(window=60).mean()
     
@@ -190,11 +253,13 @@ def generate_stock_report(code: str) -> str:
     is_above_ma20 = curr_price >= ma20
     is_above_ma60 = curr_price >= ma60
 
+    # 七大體質
     stock = yf.Ticker(ticker, session=session)
     info = stock.info if hasattr(stock, "info") else {}
     fund = evaluate_seven_fundamentals(stock, info)
     score = fund["pass_count"]
 
+    # 法人目標價
     target_info = fetch_tw_analyst_targets(code)
     if target_info:
         target_mean = target_info["mean"]
@@ -210,38 +275,43 @@ def generate_stock_report(code: str) -> str:
 
     target_upside = ((target_mean - curr_price) / curr_price) * 100 if has_target else 0.0
 
+    # 價格區間計算
+    val_bands = calculate_valuation_bands(curr_price, fund["pe"], target_mean)
+
+    # 技術關鍵價位
     entry_tier1 = round(curr_price, 2)
     entry_tier2 = round(ma20, 2)
     entry_tier3 = round(min(ma60, recent_low_20), 2)
     stop_loss_price = round(min(ma60 * 0.96, recent_low_60 * 0.98), 2)
     stop_loss_pct = round(((stop_loss_price - curr_price) / curr_price) * 100, 2)
-    tp_tier1 = round(target_mean, 2) if has_target else round(curr_price * 1.15, 2)
-    tp_tier2 = round(max(target_high if has_target else 0, recent_high_60 * 1.1), 2)
+    tp_tier1 = round(target_mean, 2) if has_target else round(val_bands["fair"] * 1.15, 2)
+    tp_tier2 = round(max(target_high if has_target else 0, val_bands["expensive"]), 2)
 
+    # 整合「體質 + 價格區間 + 技術位階」教練決策引擎
     if not is_above_ma60 and score < 4:
         status_state = "弱勢破線格局（跌破季線 且 體質未達標）"
         coach_signal = "⚫ 停損換股 / 嚴格避開"
-        action_plan = f"跌破 60MA 季線生命線，且七項長線體質僅通過 {score}/7 項，長線資金應嚴格保護本金避免抄底。"
-    elif has_target and target_upside < -5.0 and curr_price >= recent_high_60 * 0.95:
-        status_state = "估值過熱區間（超越法人共識目標價）"
+        action_plan = f"跌破 60MA 季線生命線，且長線體質僅得 {score}/7 分，資金應優先保護本金，切勿逆勢撈底。"
+    elif val_bands["zone_type"] == "EXPENSIVE" or (has_target and target_upside < -5.0):
+        status_state = "估值過熱區間（高於昂貴價 / 超越目標價）"
         coach_signal = "🔴 分批獲利了結"
-        action_plan = f"現價已超越法人平均目標價 ({target_mean:.2f} 元)，乖離過大，建議在第一/第二目標價分批收回利潤。"
-    elif score >= 5 and is_above_ma60 and (target_upside >= 12.0 or not has_target):
-        status_state = "強勢成長格局（護城河頂級 ＋ 站穩季線）"
-        coach_signal = "🟢 強力買進 / 分批建倉"
-        action_plan = f"七大長線體質獲 {score}/7 高分，站穩季線且具上漲空間。建議依 30%(現價) / 40%(月線) / 30%(季線) 梯隊建立長線部位。"
+        action_plan = f"現價處於昂貴價 ({val_bands['expensive']} 元) 之上，短期獲利空間壓縮，建議在第一/第二目標位逐步減碼收回本利。"
+    elif score >= 5 and val_bands["zone_type"] in ["CHEAP", "FAIR_LOW"] and is_above_ma60:
+        status_state = "黃金共振進場（護城河頂級 ＋ 估值偏低 ＋ 站穩季線）"
+        coach_signal = "🟢 強力買進 / 積極建倉"
+        action_plan = f"體質通過 {score}/7 項且處於【{val_bands['zone_status'].split('（')[0]}】，安全邊際充足，建議按 30%(現價) / 40%(月線) / 30%(季線) 梯隊積極布局。"
     elif score >= 4 and is_above_ma60:
-        status_state = "多頭震盪整理（基本面穩健）"
+        status_state = "多頭穩健推進（基本面良好 ＋ 估值合理）"
         coach_signal = "🟡 逢低承接 / 續抱觀察"
-        action_plan = f"體質通過 {score}/7 項且多頭架構未變。持股續抱，加碼等待股價拉回月線 ({ma20:.2f} 元) 或季線支撐。"
+        action_plan = f"長線多頭架構未變。原有部位續抱；欲加碼者建議在股價拉回月線 ({ma20:.2f} 元) 或便宜價位附近再行分批介入。"
     elif score >= 5 and not is_above_ma60:
-        status_state = "好公司遇逆風（體質優異但處於技術修正）"
-        coach_signal = "🟠 觀察等待 / 築底浮現再買"
-        action_plan = f"體質拿下 {score}/7 高分，但目前在 60MA 季線之下修正。建議列入核心名單，等待股價止跌重回季線再行進場。"
+        status_state = "好公司遇逆風（體質優異但技術面修正）"
+        coach_signal = "🟠 觀察等待 / 築底完成再進"
+        action_plan = f"體質優異 ({score}/7 分) 且已修正至合理價位，但目前受大盤壓制在季線之下。建議列入自選核心，等待帶量站回季線後進場。"
     else:
-        status_state = "盤整待變 / 體質普通"
+        status_state = "盤整待變 / 競爭優勢普通"
         coach_signal = "🟠 觀望等待"
-        action_plan = "多空訊號未達共振標準，長線競爭優勢尚不明顯，建議保留現金。"
+        action_plan = "多空訊號未達共振標準，未見顯著安全邊際，建議保留現金耐心等待。"
 
     if has_target:
         analyst_section = f"• 涵蓋機構：{analyst_count} 家法人報告\n• 平均目標：**{target_mean:.2f} 元** (空間: `{target_upside:+.1f}%`)\n• 目標區間：{target_low:.2f} ~ {target_high:.2f} 元\n"
@@ -250,6 +320,7 @@ def generate_stock_report(code: str) -> str:
     else:
         analyst_section = "• 暫無近半年公開目標價（中小型股或未被大型投顧覆蓋）。\n"
 
+    # Discord 格式輸出
     return (
         f"📊 **【 {company_name} ({code}) 長線全方位深度診斷】**\n"
         f"────────────────────────\n"
@@ -262,9 +333,14 @@ def generate_stock_report(code: str) -> str:
         f"5. 毛利率走勢 (持穩/上升): {fund['gm_str']} ({'✅' if fund['pass_gm'] else '❌'})\n"
         f"6. 估值比 (PEG≦1.2/合理): {fund['peg_str']} ({'✅' if fund['pass_peg'] else '⚠️'})\n"
         f"7. 盈餘配發率 (35%-65%): {fund['payout_str']} ({'✅' if fund['pass_payout'] else '⚠️'})\n\n"
-        f"🎯 **二、法人目標價與評等共識**\n"
+        f"🏷️ **二、長線合理價格區間評估**\n"
+        f"• 便宜價（安全邊際）：`{val_bands['cheap']} 元`\n"
+        f"• 合理價（公允價值）：`{val_bands['fair']} 元`\n"
+        f"• 昂貴價（估值過熱）：`{val_bands['expensive']} 元`\n"
+        f"• **當前位階**：{val_bands['zone_status']}\n\n"
+        f"🎯 **三、法人目標價與評等共識**\n"
         f"{analyst_section}\n"
-        f"💡 **三、技術關鍵價位**\n"
+        f"💡 **四、技術關鍵價位**\n"
         f"【分批進場梯隊】\n"
         f"• 第一批(現價底倉 30%)：`{entry_tier1} 元`\n"
         f"• 第二批(月線加碼 40%)：`{entry_tier2} 元`\n"
@@ -275,7 +351,7 @@ def generate_stock_report(code: str) -> str:
         f"• 第一目標(減碼 1/2)：`{tp_tier1} 元`\n"
         f"• 第二目標(波段全出)：`{tp_tier2} 元`\n\n"
         f"────────────────────────\n"
-        f"🧭 **四、【操盤教練決策建議】**\n"
+        f"🧭 **五、【操盤教練決策建議】**\n"
         f"• 標的狀態：**{status_state}**\n"
         f"• 操作指令：**{coach_signal}**\n"
         f"• 決策理由：{action_plan}\n"
@@ -300,19 +376,16 @@ async def on_message(message):
         return
 
     user_text = message.content.strip()
-    print(f"📥 [收到訊息] 來自【{message.author}】在頻道【{message.channel}】：'{user_text}'")
+    print(f"📥 [收到訊息] 來自【{message.author}】：'{user_text}'")
 
-    # 1. 測試指令
     if user_text.lower() == "ping":
         await message.channel.send("🏓 Pong! 機器人連線完全正常！請輸入 4 位數股票代碼（如 2330）。")
         return
 
-    # 2. 判斷 4 位數股票代碼
     if len(user_text) == 4 and user_text.isdigit():
         stock_name = get_tw_stock_name(user_text)
-        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行七大體質健檢與價位精算，請稍候約 3~5 秒...")
+        wait_msg = await message.channel.send(f"🔍 正在對【{stock_name} ({user_text})】進行七大體質檢驗與價格區間評估，請稍候約 3~5 秒...")
         try:
-            # 使用非同步背景執行緒，避免卡住 Discord
             report = await asyncio.to_thread(generate_stock_report, user_text)
             await wait_msg.edit(content=report)
         except Exception as e:
@@ -321,7 +394,7 @@ async def on_message(message):
             
     await bot.process_commands(message)
 
-# ================= 輕量 Web 伺服器 =================
+# ================= 輕量 Web 伺服器 (Render 保活用) =================
 class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -335,8 +408,7 @@ def run_web():
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    token = DISCORD_BOT_TOKEN
-    if not token:
+    if not DISCORD_BOT_TOKEN:
         print("❌ 錯誤：未在環境變數中找到 DISCORD_BOT_TOKEN！")
     else:
-        bot.run(token)
+        bot.run(DISCORD_BOT_TOKEN)
