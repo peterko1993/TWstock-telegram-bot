@@ -11,10 +11,25 @@ st.set_page_config(
     layout="wide"
 )
 
+# ================= 1. 安全且保證讀取 Secrets 的機制 =================
+DEFAULT_WEBHOOK = ""
+try:
+    if hasattr(st, "secrets") and "DISCORD_WEBHOOK_URL" in st.secrets:
+        DEFAULT_WEBHOOK = str(st.secrets["DISCORD_WEBHOOK_URL"]).strip()
+except Exception:
+    pass
+
+# ================= 2. 狀態常駐（防止點擊推播時表格消失） =================
+if "scan_results" not in st.session_state:
+    st.session_state["scan_results"] = None
+if "candidate_count" not in st.session_state:
+    st.session_state["candidate_count"] = 0
+if "total_count" not in st.session_state:
+    st.session_state["total_count"] = 0
+
 # ================= 官方全市場快速抓取 =================
-@st.cache_data(ttl=14400) # 快取 4 小時
+@st.cache_data(ttl=14400)
 def fetch_twse_market_pe_pbr():
-    """從證交所 OpenAPI 2 秒下載全上市公司 (約 1000 檔) 本益比與淨值比總表"""
     url = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_d"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -27,29 +42,20 @@ def fetch_twse_market_pe_pbr():
                 name = item.get("Name", "").strip()
                 pe_raw = item.get("PEratio", "").replace(",", "")
                 pb_raw = item.get("PBratio", "").replace(",", "")
-                
-                # 只保留 4 位數普通股
                 if len(code) == 4 and code.isdigit():
                     try:
                         pe = float(pe_raw) if pe_raw and pe_raw != "-" else None
                         pb = float(pb_raw) if pb_raw and pb_raw != "-" else None
-                        stocks.append({
-                            "code": code,
-                            "name": name,
-                            "pe_market": pe,
-                            "pb_market": pb,
-                            "market": "TW"
-                        })
+                        stocks.append({"code": code, "name": name, "pe_market": pe, "pb_market": pb, "market": "TW"})
                     except ValueError:
                         continue
             return pd.DataFrame(stocks)
-    except Exception as e:
-        st.error(f"連線證交所開放資料異常: {e}")
+    except Exception:
+        pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=14400)
 def fetch_tpex_market_pe_pbr():
-    """從櫃買中心開放資料下載全上櫃公司 (約 800 檔) 本益比與淨值比總表"""
     url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -58,23 +64,15 @@ def fetch_tpex_market_pe_pbr():
             data = res.json()
             stocks = []
             for item in data:
-                # 兼容不同欄位命名
                 code = str(item.get("SecuritiesCompanyCode") or item.get("CompanyCode") or item.get("Code") or "").strip()
                 name = str(item.get("CompanyName") or item.get("Name") or "").strip()
                 pe_raw = str(item.get("PriceEarningRatio") or item.get("PEratio") or "").replace(",", "")
                 pb_raw = str(item.get("PriceBookRatio") or item.get("PBratio") or "").replace(",", "")
-                
                 if len(code) == 4 and code.isdigit():
                     try:
                         pe = float(pe_raw) if pe_raw and pe_raw != "-" else None
                         pb = float(pb_raw) if pb_raw and pb_raw != "-" else None
-                        stocks.append({
-                            "code": code,
-                            "name": name,
-                            "pe_market": pe,
-                            "pb_market": pb,
-                            "market": "TWO"
-                        })
+                        stocks.append({"code": code, "name": name, "pe_market": pe, "pb_market": pb, "market": "TWO"})
                     except ValueError:
                         continue
             return pd.DataFrame(stocks)
@@ -85,7 +83,6 @@ def fetch_tpex_market_pe_pbr():
 # ================= 單檔深入財報精算 =================
 @st.cache_data(ttl=3600)
 def deep_analyze_stock(code, name, market_type):
-    """只對初篩通過的少數股票進行 yfinance 深度分析"""
     try:
         ticker = f"{code}.{market_type}"
         stock = yf.Ticker(ticker)
@@ -96,7 +93,6 @@ def deep_analyze_stock(code, name, market_type):
         curr_price = float(df_hist["Close"].iloc[-1])
         fin = stock.financials
         bs = stock.balance_sheet
-        
         if fin.empty or bs.empty:
             return None
 
@@ -120,10 +116,7 @@ def deep_analyze_stock(code, name, market_type):
             bs.loc["Total Equity Gross Minority Interest"].iloc[0] if "Total Equity Gross Minority Interest" in bs.index else None
         )
         shares = stock.fast_info.shares if hasattr(stock, "fast_info") and hasattr(stock.fast_info, "shares") else None
-        if equity and shares and shares > 0:
-            pbr = round(curr_price / (equity / shares), 2)
-        else:
-            pbr = 1.0
+        pbr = round(curr_price / (equity / shares), 2) if (equity and shares and shares > 0) else 1.0
 
         # 4. ROE
         net_incomes = fin.loc["Net Income Common Stockholders"] if "Net Income Common Stockholders" in fin.index else fin.loc["Net Income"]
@@ -163,15 +156,18 @@ def deep_analyze_stock(code, name, market_type):
         return None
 
 def send_to_discord(webhook_url: str, selected_stocks: list):
-    """發布到 Discord 頻道"""
-    content = "📢 **【全台股收益價值雷達 - 掃描精選結果】**\n────────────────────────\n"
+    content = "📢 **【全台股收益價值雷達 - 精選標的名單】**\n────────────────────────\n"
     for item in selected_stocks:
         content += (
             f"📌 **{item['名稱']} ({item['代號']})** | 現價: `{item['現價']:.2f}`\n"
             f"• 營益率: `{item['營益率(%)']:.1f}%` | PE: `{item['本益比(PE)']}x` | PBR: `{item['淨值比(PBR)']}x`\n"
             f"• 5年均ROE: `{item['五年均ROE(%)']:.1f}%` | 自主PEG: `{item['自主PEG']}`\n────────────────────────\n"
         )
-    return requests.post(webhook_url, json={"content": content}).status_code == 204
+    try:
+        res = requests.post(webhook_url.strip(), json={"content": content}, timeout=8)
+        return res.status_code == 204
+    except Exception:
+        return False
 
 # ================= UI 介面 =================
 st.title("🏛️ 全台股收益價值投資自動篩選雷達")
@@ -190,10 +186,30 @@ with st.sidebar:
     filter_peg = st.checkbox("嚴格限制 PEG ≤ 1.2 (排除負成長與高估)", value=False)
     
     st.divider()
-    webhook_url = st.text_input("Discord Webhook URL", type="password")
+    st.header("🔔 Discord 聯動設置")
+    webhook_url = st.text_input(
+        "Discord Webhook URL",
+        value=DEFAULT_WEBHOOK,
+        type="password",
+        help="由後台 Secrets 自動填入，亦可手動貼上"
+    )
+    
+    # 即時連通測試按鈕
+    if st.button("⚡ 測試 Discord 連線", use_container_width=True):
+        if webhook_url:
+            try:
+                t_res = requests.post(webhook_url.strip(), json={"content": "🏓 測試成功！Streamlit 與 Discord 已完美連線！"}, timeout=5)
+                if t_res.status_code == 204:
+                    st.toast("✅ 測試訊息已成功送達 Discord！")
+                else:
+                    st.error(f"❌ 傳送失敗，狀態碼：{t_res.status_code}，請檢查網址。")
+            except Exception as e:
+                st.error(f"❌ 連線異常：{e}")
+        else:
+            st.warning("⚠️ 尚未讀取到 Webhook 網址，請確認 Secrets 設定。")
 
+# 掃描觸發按鈕
 if st.button("🚀 開始全市場智慧掃描", type="primary", use_container_width=True):
-    # 步驟一：下載官方全市場總表
     with st.spinner("⚡ [1/2] 正在向證交所與櫃買中心下載全市場官方總表..."):
         if "上市+上櫃" in market_choice:
             df_twse = fetch_twse_market_pe_pbr()
@@ -207,8 +223,7 @@ if st.button("🚀 開始全市場智慧掃描", type="primary", use_container_w
     if df_market.empty:
         st.error("無法取得全市場開放資料，請稍候再試。")
     else:
-        total_count = len(df_market)
-        # 步驟二：第一階段極速過濾
+        st.session_state["total_count"] = len(df_market)
         df_filtered = df_market[
             (df_market["pe_market"].notna()) &
             (df_market["pe_market"] > 0) &
@@ -217,39 +232,48 @@ if st.button("🚀 開始全市場智慧掃描", type="primary", use_container_w
             (df_market["pb_market"] <= max_pbr)
         ].copy()
         
-        candidate_count = len(df_filtered)
-        st.info(f"📊 全市場共掃描 **{total_count}** 檔股票 ➔ 經初篩 (PE≤{max_pe}, PBR≤{max_pbr}) 後鎖定 **{candidate_count}** 檔潛力股進入深度財報精算！")
+        candidates = df_filtered.to_dict(orient="records")
+        st.session_state["candidate_count"] = len(candidates)
         
-        # 步驟三：深度財報精算
         progress = st.progress(0)
         status = st.empty()
         deep_results = []
         
-        candidates = df_filtered.to_dict(orient="records")
         for i, row in enumerate(candidates):
-            status.text(f"正在精算財報: {row['name']} ({row['code']}) [{i+1}/{candidate_count}]...")
+            status.text(f"正在精算財報: {row['name']} ({row['code']}) [{i+1}/{len(candidates)}]...")
             res = deep_analyze_stock(row["code"], row["name"], row["market"])
             if res:
-                # 第二階段門檻過濾
                 if res["營益率(%)"] >= min_op_margin and res["五年均ROE(%)"] >= min_roe:
                     if not filter_peg or (filter_peg and res["_peg_num"] <= 1.2):
                         deep_results.append(res)
-            progress.progress((i + 1) / candidate_count)
+            progress.progress((i + 1) / len(candidates))
             
         progress.empty()
         status.empty()
+        st.session_state["scan_results"] = deep_results
+
+# ================= 結果展示與常駐推播區 =================
+if st.session_state["scan_results"] is not None:
+    results = st.session_state["scan_results"]
+    st.info(f"📊 全市場共掃描 **{st.session_state['total_count']}** 檔股票 ➔ 經初篩後鎖定 **{st.session_state['candidate_count']}** 檔進入精算！")
+    
+    if results:
+        result_df = pd.DataFrame(results)
+        st.success(f"🎉 掃描完成！全市場最終挑選出 **{len(result_df)}** 檔符合【收益價值投資】的高勝率卓越標的：")
+        cols = ["代號", "名稱", "現價", "營益率(%)", "本益比(PE)", "淨值比(PBR)", "五年均ROE(%)", "自主PEG"]
+        st.dataframe(result_df[cols], use_container_width=True)
         
-        if deep_results:
-            result_df = pd.DataFrame(deep_results)
-            st.success(f"🎉 掃描完成！全市場最終挑選出 **{len(result_df)}** 檔符合【收益價值投資】的高勝率卓越標的：")
-            cols = ["代號", "名稱", "現價", "營益率(%)", "本益比(PE)", "淨值比(PBR)", "五年均ROE(%)", "自主PEG"]
-            st.dataframe(result_df[cols], use_container_width=True)
-            
-            if webhook_url:
-                if st.button("📢 將此精選名單推送至 Discord 頻道"):
-                    if send_to_discord(webhook_url, deep_results):
-                        st.toast("✅ 已成功推送至 Discord！")
+        st.divider()
+        # 推播按鈕獨立常駐展示
+        col_btn, _ = st.columns([2, 3])
+        with col_btn:
+            if st.button("📢 將此精選名單推送至 Discord 頻道", type="secondary", use_container_width=True):
+                if webhook_url:
+                    if send_to_discord(webhook_url, results):
+                        st.toast("✅ 已成功推送至 Discord 頻道！")
                     else:
-                        st.error("推送失敗，請檢查 Webhook 網址。")
-        else:
-            st.warning("初篩出的候選股在深度財報檢驗中未達標，建議在左側放寬營益率或 ROE 門檻。")
+                        st.error("❌ 推送失敗，請確認 Webhook 網址是否正確。")
+                else:
+                    st.warning("⚠️ 請先在側邊欄填入 Webhook URL 才能發送。")
+    else:
+        st.warning("初篩出的候選股在深度財報檢驗中未達標，建議在左側放寬營益率或 ROE 門檻。")
