@@ -5,6 +5,7 @@ import requests
 import json
 import twstock
 import time
+from collections import defaultdict
 
 st.set_page_config(
     page_title="全台股收益價值投資篩選雷達",
@@ -12,7 +13,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# ================= 1. 安全且保證讀取 Secrets 的機制 =================
+# ================= 1. 安全讀取 Secrets =================
 DEFAULT_WEBHOOK = ""
 try:
     if hasattr(st, "secrets") and "DISCORD_WEBHOOK_URL" in st.secrets:
@@ -27,6 +28,14 @@ if "candidate_count" not in st.session_state:
     st.session_state["candidate_count"] = 0
 if "total_count" not in st.session_state:
     st.session_state["total_count"] = 0
+
+def get_stock_industry(code: str) -> str:
+    """取得台股官方標準產業分類"""
+    if code in twstock.codes:
+        group = twstock.codes[code].group
+        if group and group.strip():
+            return group.strip()
+    return "其他類"
 
 # ================= 官方全市場快速抓取 =================
 @st.cache_data(ttl=14400)
@@ -97,6 +106,9 @@ def deep_analyze_stock(code, name, market_type):
         if fin.empty or bs.empty:
             return None
 
+        # 0. 產業分類
+        industry = get_stock_industry(code)
+
         # 1. 營業利益率
         op_inc = fin.loc["Operating Income"].iloc[0] if "Operating Income" in fin.index else 0
         rev = fin.loc["Total Revenue"].iloc[0] if "Total Revenue" in fin.index else 1
@@ -145,6 +157,7 @@ def deep_analyze_stock(code, name, market_type):
         return {
             "代號": code,
             "名稱": name,
+            "產業": industry,
             "現價": round(curr_price, 2),
             "營益率(%)": round(op_margin, 1),
             "本益比(PE)": round(pe, 1) if pe else None,
@@ -156,47 +169,67 @@ def deep_analyze_stock(code, name, market_type):
     except Exception:
         return None
 
-# ================= 解決 2000 字上限的自動分批推播函式 =================
+# ================= 依產業分類排版分批發送至 Discord =================
 def send_to_discord(webhook_url: str, selected_stocks: list):
-    """將名單自動拆分為多則符合 2000 字限制的訊息分批發送"""
     if not webhook_url or not selected_stocks:
         return False
-        
+
+    # 按產業分類歸納
+    industry_groups = defaultdict(list)
+    for s in selected_stocks:
+        industry_groups[s["產業"]].append(s)
+
+    # 產業圖示映射
+    icon_map = {
+        "半導體業": "⚡", "電子零組件業": "🔌", "電腦及週邊設備業": "💻",
+        "通信網路業": "📡", "光電業": "💡", "電子通路業": "📦", "資訊服務業": "🖥️",
+        "建材營造": "🏗️", "生技醫療業": "💊", "電機機械": "⚙️", "鋼鐵工業": "🔩",
+        "化學工業": "🧪", "航運業": "🚢", "觀光餐旅": "✈️", "金融保險業": "🏦"
+    }
+
     messages = []
-    current_msg = f"📢 **【全台股收益價值雷達 - 精選標的名單】（共 {len(selected_stocks)} 檔）**\n────────────────────────\n"
-    
-    for item in selected_stocks:
-        stock_line = (
-            f"📌 **{item['名稱']} ({item['代號']})** | 現價: `{item['現價']:.2f}`\n"
-            f"• 營益率: `{item['營益率(%)']:.1f}%` | PE: `{item['本益比(PE)']}x` | PBR: `{item['淨值比(PBR)']}x`\n"
-            f"• 5年均ROE: `{item['五年均ROE(%)']:.1f}%` | 自主PEG: `{item['自主PEG']}`\n"
-            f"────────────────────────\n"
-        )
-        # 若單則訊息加上此筆後超過 1800 字，先封裝成一則，另起新訊息
-        if len(current_msg) + len(stock_line) > 1800:
+    current_msg = f"📢 **【全台股收益價值雷達 - 產業鏈精選名單】（共 {len(selected_stocks)} 檔）**\n"
+
+    for ind, items in sorted(industry_groups.items(), key=lambda x: len(x[1]), reverse=True):
+        icon = icon_map.get(ind, "📁")
+        sec_header = f"\n{icon} **【{ind}】（{len(items)} 檔）**\n──────────────────\n"
+        
+        # 若加上標題會爆字數，先另起新則
+        if len(current_msg) + len(sec_header) > 1800:
             messages.append(current_msg)
-            current_msg = "續前頁精選名單：\n────────────────────────\n" + stock_line
+            current_msg = sec_header
         else:
-            current_msg += stock_line
-            
+            current_msg += sec_header
+
+        for item in items:
+            stock_line = (
+                f"• **{item['名稱']} ({item['代號']})** | 現價:`{item['現價']:.2f}`\n"
+                f"  營益率:`{item['營益率(%)']:.1f}%` | PE:`{item['本益比(PE)']}x` | PBR:`{item['淨值比(PBR)']}x` | ROE:`{item['五年均ROE(%)']:.1f}%`\n"
+            )
+            if len(current_msg) + len(stock_line) > 1800:
+                messages.append(current_msg)
+                current_msg = f"{icon} **【{ind} 續】**\n──────────────────\n" + stock_line
+            else:
+                current_msg += stock_line
+
     if current_msg:
         messages.append(current_msg)
-        
+
     all_success = True
     for msg in messages:
         try:
             res = requests.post(webhook_url.strip(), json={"content": msg}, timeout=8)
             if res.status_code != 204:
                 all_success = False
-            time.sleep(0.5)  # 避免觸發 Discord 頻率限制
+            time.sleep(0.5)
         except Exception:
             all_success = False
-            
+
     return all_success
 
 # ================= UI 介面 =================
 st.title("🏛️ 全台股收益價值投資自動篩選雷達")
-st.caption("官方 OpenAPI 毫秒級全市場粗篩 ➔ yfinance 深度基本面精算 ➔ Discord 一鍵發布")
+st.caption("官方 OpenAPI 毫秒級全市場粗篩 ➔ 官方產業鏈自動歸類 ➔ yfinance 深度基本面精算 ➔ Discord 分類推播")
 
 with st.sidebar:
     st.header("🔍 掃描市場範圍")
@@ -275,26 +308,46 @@ if st.button("🚀 開始全市場智慧掃描", type="primary", use_container_w
         status.empty()
         st.session_state["scan_results"] = deep_results
 
-# ================= 結果展示與推播 =================
+# ================= 結果展示與產業分類區 =================
 if st.session_state["scan_results"] is not None:
     results = st.session_state["scan_results"]
     st.info(f"📊 全市場共掃描 **{st.session_state['total_count']}** 檔股票 ➔ 經初篩後鎖定 **{st.session_state['candidate_count']}** 檔進入精算！")
     
     if results:
-        result_df = pd.DataFrame(results)
-        st.success(f"🎉 掃描完成！全市場最終挑選出 **{len(result_df)}** 檔符合【收益價值投資】的高勝率卓越標的：")
-        cols = ["代號", "名稱", "現價", "營益率(%)", "本益比(PE)", "淨值比(PBR)", "五年均ROE(%)", "自主PEG"]
-        st.dataframe(result_df[cols], use_container_width=True)
+        df_raw = pd.DataFrame(results)
+        st.success(f"🎉 掃描完成！全市場最終挑選出 **{len(df_raw)}** 檔符合【收益價值投資】的高勝率卓越標的：")
+        
+        # 1. 產業統計概況卡片
+        industry_counts = df_raw["產業"].value_counts()
+        st.markdown("### 🏢 本次低估標的之產業分佈概況")
+        
+        # 視覺化產業分佈長條圖
+        st.bar_chart(industry_counts)
+
+        # 2. 產業互動過濾器
+        all_industries = ["全部產業"] + list(industry_counts.index)
+        selected_ind = st.multiselect("🎯 快速依特定產業過濾表格：", options=all_industries, default=["全部產業"])
+        
+        if "全部產業" in selected_ind or not selected_ind:
+            display_df = df_raw.copy()
+        else:
+            display_df = df_raw[df_raw["產業"].isin(selected_ind)].copy()
+
+        cols = ["代號", "名稱", "產業", "現價", "營益率(%)", "本益比(PE)", "淨值比(PBR)", "五年均ROE(%)", "自主PEG"]
+        st.dataframe(display_df[cols], use_container_width=True)
         
         st.divider()
+        # 3. 推播按鈕
         col_btn, _ = st.columns([2, 3])
         with col_btn:
-            if st.button("📢 將此精選名單推送至 Discord 頻道", type="secondary", use_container_width=True):
+            if st.button("📢 將此精選名單（按產業分類）推送至 Discord", type="secondary", use_container_width=True):
                 target_url = webhook_url if webhook_url else DEFAULT_WEBHOOK
                 if target_url:
-                    with st.spinner("正在自動分批推送至 Discord..."):
-                        if send_to_discord(target_url, results):
-                            st.toast("✅ 已成功分批推送至 Discord 頻道！")
+                    # 推送目前過濾後的名單，若未過濾則推送全部
+                    push_list = display_df.to_dict(orient="records")
+                    with st.spinner("正在依產業排版並分批推送至 Discord..."):
+                        if send_to_discord(target_url, push_list):
+                            st.toast("✅ 已成功依產業分類推送至 Discord 頻道！")
                         else:
                             st.error("❌ 推送失敗，請確認 Webhook 網址是否正確。")
                 else:
