@@ -1,6 +1,7 @@
 discord.py
-requests
+yfinance
 pandas
 numpy
 twstock
-yfinance
+requests
+streamlit
