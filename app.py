@@ -4,6 +4,7 @@ import yfinance as yf
 import requests
 import json
 import twstock
+import time
 
 st.set_page_config(
     page_title="全台股收益價值投資篩選雷達",
@@ -19,7 +20,7 @@ try:
 except Exception:
     pass
 
-# ================= 2. 狀態常駐（防止點擊推播時表格消失） =================
+# ================= 2. 狀態常駐 =================
 if "scan_results" not in st.session_state:
     st.session_state["scan_results"] = None
 if "candidate_count" not in st.session_state:
@@ -155,19 +156,43 @@ def deep_analyze_stock(code, name, market_type):
     except Exception:
         return None
 
+# ================= 解決 2000 字上限的自動分批推播函式 =================
 def send_to_discord(webhook_url: str, selected_stocks: list):
-    content = "📢 **【全台股收益價值雷達 - 精選標的名單】**\n────────────────────────\n"
+    """將名單自動拆分為多則符合 2000 字限制的訊息分批發送"""
+    if not webhook_url or not selected_stocks:
+        return False
+        
+    messages = []
+    current_msg = f"📢 **【全台股收益價值雷達 - 精選標的名單】（共 {len(selected_stocks)} 檔）**\n────────────────────────\n"
+    
     for item in selected_stocks:
-        content += (
+        stock_line = (
             f"📌 **{item['名稱']} ({item['代號']})** | 現價: `{item['現價']:.2f}`\n"
             f"• 營益率: `{item['營益率(%)']:.1f}%` | PE: `{item['本益比(PE)']}x` | PBR: `{item['淨值比(PBR)']}x`\n"
-            f"• 5年均ROE: `{item['五年均ROE(%)']:.1f}%` | 自主PEG: `{item['自主PEG']}`\n────────────────────────\n"
+            f"• 5年均ROE: `{item['五年均ROE(%)']:.1f}%` | 自主PEG: `{item['自主PEG']}`\n"
+            f"────────────────────────\n"
         )
-    try:
-        res = requests.post(webhook_url.strip(), json={"content": content}, timeout=8)
-        return res.status_code == 204
-    except Exception:
-        return False
+        # 若單則訊息加上此筆後超過 1800 字，先封裝成一則，另起新訊息
+        if len(current_msg) + len(stock_line) > 1800:
+            messages.append(current_msg)
+            current_msg = "續前頁精選名單：\n────────────────────────\n" + stock_line
+        else:
+            current_msg += stock_line
+            
+    if current_msg:
+        messages.append(current_msg)
+        
+    all_success = True
+    for msg in messages:
+        try:
+            res = requests.post(webhook_url.strip(), json={"content": msg}, timeout=8)
+            if res.status_code != 204:
+                all_success = False
+            time.sleep(0.5)  # 避免觸發 Discord 頻率限制
+        except Exception:
+            all_success = False
+            
+    return all_success
 
 # ================= UI 介面 =================
 st.title("🏛️ 全台股收益價值投資自動篩選雷達")
@@ -194,7 +219,6 @@ with st.sidebar:
         help="由後台 Secrets 自動填入，亦可手動貼上"
     )
     
-    # 即時連通測試按鈕
     if st.button("⚡ 測試 Discord 連線", use_container_width=True):
         if webhook_url:
             try:
@@ -202,13 +226,12 @@ with st.sidebar:
                 if t_res.status_code == 204:
                     st.toast("✅ 測試訊息已成功送達 Discord！")
                 else:
-                    st.error(f"❌ 傳送失敗，狀態碼：{t_res.status_code}，請檢查網址。")
+                    st.error(f"❌ 傳送失敗，狀態碼：{t_res.status_code}")
             except Exception as e:
                 st.error(f"❌ 連線異常：{e}")
         else:
-            st.warning("⚠️ 尚未讀取到 Webhook 網址，請確認 Secrets 設定。")
+            st.warning("⚠️ 尚未讀取到 Webhook 網址。")
 
-# 掃描觸發按鈕
 if st.button("🚀 開始全市場智慧掃描", type="primary", use_container_width=True):
     with st.spinner("⚡ [1/2] 正在向證交所與櫃買中心下載全市場官方總表..."):
         if "上市+上櫃" in market_choice:
@@ -252,7 +275,7 @@ if st.button("🚀 開始全市場智慧掃描", type="primary", use_container_w
         status.empty()
         st.session_state["scan_results"] = deep_results
 
-# ================= 結果展示與常駐推播區 =================
+# ================= 結果展示與推播 =================
 if st.session_state["scan_results"] is not None:
     results = st.session_state["scan_results"]
     st.info(f"📊 全市場共掃描 **{st.session_state['total_count']}** 檔股票 ➔ 經初篩後鎖定 **{st.session_state['candidate_count']}** 檔進入精算！")
@@ -264,15 +287,16 @@ if st.session_state["scan_results"] is not None:
         st.dataframe(result_df[cols], use_container_width=True)
         
         st.divider()
-        # 推播按鈕獨立常駐展示
         col_btn, _ = st.columns([2, 3])
         with col_btn:
             if st.button("📢 將此精選名單推送至 Discord 頻道", type="secondary", use_container_width=True):
-                if webhook_url:
-                    if send_to_discord(webhook_url, results):
-                        st.toast("✅ 已成功推送至 Discord 頻道！")
-                    else:
-                        st.error("❌ 推送失敗，請確認 Webhook 網址是否正確。")
+                target_url = webhook_url if webhook_url else DEFAULT_WEBHOOK
+                if target_url:
+                    with st.spinner("正在自動分批推送至 Discord..."):
+                        if send_to_discord(target_url, results):
+                            st.toast("✅ 已成功分批推送至 Discord 頻道！")
+                        else:
+                            st.error("❌ 推送失敗，請確認 Webhook 網址是否正確。")
                 else:
                     st.warning("⚠️ 請先在側邊欄填入 Webhook URL 才能發送。")
     else:
